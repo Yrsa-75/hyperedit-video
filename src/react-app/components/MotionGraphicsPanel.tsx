@@ -62,6 +62,7 @@ export default function MotionGraphicsPanel({ onAddToTimeline }: MotionGraphicsP
   const handleSelectTemplate = (id: TemplateId) => {
     setSelectedTemplate(id);
     setTemplateProps({ ...MOTION_TEMPLATES[id].defaultProps });
+    if (id === 'lower-third') setDuration(8);
   };
 
   const handleUpdateProp = (key: string, value: unknown) => {

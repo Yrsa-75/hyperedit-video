@@ -1,6 +1,6 @@
 import http from 'http';
 import { spawn, execSync } from 'child_process';
-import { createWriteStream, createReadStream, unlinkSync, mkdirSync, existsSync, writeFileSync, readFileSync, readdirSync, statSync } from 'fs';
+import { createWriteStream, createReadStream, unlinkSync, mkdirSync, rmdirSync, existsSync, writeFileSync, readFileSync, readdirSync, statSync, copyFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
@@ -39,6 +39,9 @@ const SESSIONS_DIR = join(TEMP_DIR, 'sessions');
 
 // Active video sessions - keeps videos on disk between edits
 const sessions = new Map();
+
+// Per-session operation progress: sessionId → {progress: 0-100, operation: string, status: string}
+const operationProgress = new Map();
 
 // Ensure temp directories exist
 if (!existsSync(TEMP_DIR)) {
@@ -144,6 +147,9 @@ function restoreSessionsFromDisk() {
           duration: savedMeta.duration,
           width: savedMeta.width,
           height: savedMeta.height,
+          sourceAssetId: savedMeta.sourceAssetId,
+          cropAspectRatio: savedMeta.cropAspectRatio,
+          bannerSegments: savedMeta.bannerSegments,
         });
 
         if (savedMeta.aiGenerated) {
@@ -202,6 +208,10 @@ function saveAssetMetadata(session) {
       sceneCount: asset.sceneCount,
       sceneDataPath: asset.sceneDataPath,
       editCount: asset.editCount || 0,
+      // Face-crop metadata
+      sourceAssetId: asset.sourceAssetId,
+      cropAspectRatio: asset.cropAspectRatio,
+      bannerSegments: asset.bannerSegments,
     };
   }
 
@@ -292,7 +302,7 @@ setInterval(() => {
 }, 30 * 60 * 1000); // Check every 30 minutes
 
 // Run FFmpeg command and return a promise
-function runFFmpeg(args, jobId) {
+function runFFmpeg(args, jobId, opts = {}) {
   return new Promise((resolve, reject) => {
     const ffmpeg = spawn('ffmpeg', args);
     let stderr = '';
@@ -303,18 +313,33 @@ function runFFmpeg(args, jobId) {
       for (const line of lines) {
         if (line.includes('time=') || line.includes('frame=')) {
           process.stdout.write(`\r[${jobId}] ${line.trim()}`);
+          // Parse time= to compute progress percentage
+          if (opts.totalDuration) {
+            const m = line.match(/time=(\d+):(\d+):(\d+\.?\d*)/);
+            if (m) {
+              const secs = parseInt(m[1]) * 3600 + parseInt(m[2]) * 60 + parseFloat(m[3]);
+              const pct = Math.min(99, Math.round((secs / opts.totalDuration) * 100));
+              operationProgress.set(jobId, { progress: pct, operation: opts.operation || 'processing', status: 'encoding' });
+            }
+          }
         }
       }
     });
 
     ffmpeg.on('close', (code) => {
       if (code === 0) {
+        if (opts.totalDuration) operationProgress.set(jobId, { progress: 100, operation: opts.operation || 'processing', status: 'complete' });
         resolve(stderr);
       } else {
-        reject(new Error(`FFmpeg failed with code ${code}: ${stderr.slice(-500)}`));
+        operationProgress.delete(jobId);
+        // Show first 300 chars (real errors) + last 300 chars (frame stats)
+        const errSummary = stderr.length > 600
+          ? stderr.slice(0, 300) + '\n...\n' + stderr.slice(-300)
+          : stderr;
+        reject(new Error(`FFmpeg failed with code ${code}: ${errSummary}`));
       }
     });
-    ffmpeg.on('error', reject);
+    ffmpeg.on('error', (err) => { operationProgress.delete(jobId); reject(err); });
   });
 }
 
@@ -811,7 +836,7 @@ async function handleGenerateChapters(req, res) {
     const ai = new GoogleGenAI({ apiKey });
 
     const response = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-2.5-flash',
       contents: [
         {
           role: 'user',
@@ -1373,7 +1398,7 @@ async function handleSessionChapters(req, res, sessionId) {
 
     const ai = new GoogleGenAI({ apiKey });
     const response = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-2.5-flash',
       contents: [{
         role: 'user',
         parts: [
@@ -1674,6 +1699,9 @@ function handleAssetList(req, res, sessionId) {
     height: asset.height,
     thumbnailUrl: asset.thumbPath ? `/session/${sessionId}/assets/${asset.id}/thumbnail` : null,
     aiGenerated: asset.aiGenerated || false, // True for Remotion-generated animations
+    sourceAssetId: asset.sourceAssetId || null,
+    cropAspectRatio: asset.cropAspectRatio || null,
+    bannerSegments: asset.bannerSegments || null,
   }));
 
   res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
@@ -1863,6 +1891,8 @@ function handleProjectGet(req, res, sessionId) {
     tracks: session.project.tracks,
     clips: session.project.clips,
     settings: session.project.settings,
+    captionData: session.project.captionData || {},
+    projectFilename: session.project.projectFilename || '',
   }));
 }
 
@@ -1883,6 +1913,8 @@ async function handleProjectSave(req, res, sessionId) {
     if (data.tracks) session.project.tracks = data.tracks;
     if (data.clips) session.project.clips = data.clips;
     if (data.settings) session.project.settings = { ...session.project.settings, ...data.settings };
+    if (data.captionData) session.project.captionData = data.captionData;
+    if (data.projectFilename) session.project.projectFilename = data.projectFilename;
 
     // Save to disk for persistence
     const projectPath = join(session.dir, 'project.json');
@@ -1916,6 +1948,11 @@ async function handleProjectRender(req, res, sessionId) {
 
     const clips = session.project.clips;
     const settings = session.project.settings;
+    const captionData = session.project.captionData || {};
+
+    // Use requested export dimensions or fall back to project settings
+    const renderWidth = options.width || settings.width || 1920;
+    const renderHeight = options.height || settings.height || 1080;
 
     if (clips.length === 0) {
       res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
@@ -1923,8 +1960,15 @@ async function handleProjectRender(req, res, sessionId) {
       return;
     }
 
+    operationProgress.set(sessionId, { progress: 0, operation: 'export', status: 'preparing' });
     console.log(`\n[${sessionId}] === RENDER ${isPreview ? 'PREVIEW' : 'EXPORT'} ===`);
-    console.log(`[${sessionId}] ${clips.length} clips, ${settings.width}x${settings.height}`);
+    console.log(`[${sessionId}] ${clips.length} clips, ${renderWidth}x${renderHeight}`);
+    const clipsByTrack = clips.reduce((acc, c) => { acc[c.trackId] = (acc[c.trackId] || 0) + 1; return acc; }, {});
+    console.log(`[${sessionId}] Clips by track:`, JSON.stringify(clipsByTrack));
+    for (const c of clips) {
+      const asset = session.assets.get(c.assetId);
+      console.log(`[${sessionId}]   clip track=${c.trackId} assetId=${c.assetId || '(none)'} assetFound=${!!asset} assetType=${asset?.type || '-'}`);
+    }
 
     // Sort clips by track for layering (V1 first, then V2, etc.)
     const videoClips = clips
@@ -1947,94 +1991,312 @@ async function handleProjectRender(req, res, sessionId) {
     const inputs = [];
     const filterParts = [];
     let inputIndex = 0;
+    let v1InputIdx = -1; // track V1 input index for direct audio mapping
 
     // Create black background
-    filterParts.push(`color=black:s=${settings.width}x${settings.height}:d=${totalDuration}:r=${settings.fps}[base]`);
+    filterParts.push(`color=black:s=${renderWidth}x${renderHeight}:d=${totalDuration}:r=${settings.fps}[base]`);
     let lastVideo = 'base';
 
-    // Process video clips
+    // Process video/image clips (V1, V2, V3)
     for (const clip of videoClips) {
       const asset = session.assets.get(clip.assetId);
-      if (!asset) continue;
+      if (!asset) {
+        console.log(`[${sessionId}]   SKIP clip track=${clip.trackId} — asset not found`);
+        continue;
+      }
 
-      inputs.push('-i', asset.path);
+      const isImage = asset.type === 'image';
+      const inPoint = clip.inPoint || 0;
+      const outPoint = clip.outPoint || asset.duration || clip.duration;
+      const trimDuration = isImage ? clip.duration : (outPoint - inPoint);
+
+      // Images need -loop 1 -t <duration> before -i so FFmpeg repeats the frame
+      if (isImage) {
+        inputs.push('-loop', '1', '-t', clip.duration.toString(), '-i', asset.path);
+      } else {
+        inputs.push('-i', asset.path);
+      }
       const idx = inputIndex++;
 
-      // Apply trim and scale
-      const inPoint = clip.inPoint || 0;
-      const outPoint = clip.outPoint || asset.duration;
-      const trimDuration = outPoint - inPoint;
+      // Remember V1's input index for direct audio mapping later
+      if (clip.trackId === 'V1') v1InputIdx = idx;
 
       let clipFilter = `[${idx}:v]`;
 
-      // Trim
-      clipFilter += `trim=${inPoint}:${outPoint},setpts=PTS-STARTPTS,`;
+      // Videos need trim; images are already duration-capped by -t above
+      if (!isImage) {
+        clipFilter += `trim=${inPoint}:${outPoint},setpts=PTS-STARTPTS,`;
+      }
 
       // Scale/fit to canvas
-      clipFilter += `scale=${settings.width}:${settings.height}:force_original_aspect_ratio=decrease,`;
-      clipFilter += `pad=${settings.width}:${settings.height}:(ow-iw)/2:(oh-ih)/2`;
+      clipFilter += `scale=${renderWidth}:${renderHeight}:force_original_aspect_ratio=decrease,`;
+      clipFilter += `pad=${renderWidth}:${renderHeight}:(ow-iw)/2:(oh-ih)/2`;
 
-      // Apply transform if present
-      if (clip.transform) {
-        const { x = 0, y = 0, scale = 1, opacity = 1 } = clip.transform;
-        if (scale !== 1) {
-          clipFilter += `,scale=iw*${scale}:ih*${scale}`;
-        }
-        // Opacity is handled in overlay
+      // Apply transform scale if present
+      if (clip.transform?.scale != null && clip.transform.scale !== 1) {
+        clipFilter += `,scale=iw*${clip.transform.scale}:ih*${clip.transform.scale}`;
       }
 
       clipFilter += `[v${idx}]`;
       filterParts.push(clipFilter);
 
-      // Overlay onto base
-      const overlayX = clip.transform?.x || `(W-w)/2`;
-      const overlayY = clip.transform?.y || `(H-h)/2`;
-      const enable = `between(t,${clip.start},${clip.start + trimDuration})`;
+      // Overlay position — must use != null check so x=0 / y=0 are not treated as falsy
+      const overlayX = clip.transform?.x != null ? clip.transform.x : `(W-w)/2`;
+      const overlayY = clip.transform?.y != null ? clip.transform.y : `(H-h)/2`;
+      const enable = `between(t\\,${clip.start}\\,${clip.start + trimDuration})`;
 
-      filterParts.push(`[${lastVideo}][v${idx}]overlay=x=${overlayX}:y=${overlayY}:enable='${enable}'[out${idx}]`);
+      filterParts.push(`[${lastVideo}][v${idx}]overlay=x=${overlayX}:y=${overlayY}:enable=${enable}[out${idx}]`);
       lastVideo = `out${idx}`;
+
+      console.log(`[${sessionId}]   ADDED clip track=${clip.trackId} idx=${idx} trim=${inPoint}-${outPoint} enable=${enable}`);
     }
 
-    // Rename final output
+    // === BANNER CLIPS (bannerData — lower-third text overlays, any track) ===
+    // Font setup: use Inter to match the preview UI (which inherits font-family: Inter from index.css).
+    // Relative temp-fonts/ paths avoid the Windows C: drive colon issue in FFmpeg filter options.
+    const bannerFontBold = existsSync('temp-fonts/inter-700.ttf') ? 'temp-fonts/inter-700.ttf'
+      : existsSync('temp-fonts/arialbd.ttf') ? 'temp-fonts/arialbd.ttf' : null;
+    const bannerFontSemi = existsSync('temp-fonts/inter-600.ttf') ? 'temp-fonts/inter-600.ttf'
+      : existsSync('temp-fonts/arial.ttf') ? 'temp-fonts/arial.ttf' : null;
+
+    for (const clip of clips.filter(c => c.bannerData && !c.assetId)) {
+      const { lines = [], bgcolor = '#1a2a4a', textcolor = '#ffffff' } = clip.bannerData;
+      const enable = `between(t\\,${clip.start}\\,${clip.start + clip.duration})`;
+      const safeColor = bgcolor.replace('#', '0x');
+      const safeLabelBase = `bn${clip.id.replace(/-/g, '').slice(0, 8)}`;
+
+      // Word-wrap helper: Inter ≈ 0.55× char width estimate
+      const wrapBannerLine = (text, fontsize, maxPx) => {
+        const maxChars = Math.max(10, Math.floor(maxPx / (fontsize * 0.55)));
+        if (text.length <= maxChars) return [text];
+        const result = [];
+        let cur = '';
+        for (const word of text.split(' ')) {
+          const candidate = cur ? cur + ' ' + word : word;
+          if (candidate.length <= maxChars) { cur = candidate; }
+          else { if (cur) result.push(cur); cur = word.slice(0, maxChars); }
+        }
+        if (cur) result.push(cur);
+        return result.length > 0 ? result : [text.slice(0, maxChars)];
+      };
+      // Escape text for FFmpeg single-quoted drawtext.
+      // U+0027 straight apostrophe is a special char in FFmpeg filter strings (closes single-quoted values)
+      // and the '\'' shell-escape pattern is unreliable inside filter_complex files on Windows.
+      // Fix: replace U+0027 with U+2019 RIGHT SINGLE QUOTATION MARK — visually identical, not special in FFmpeg.
+      const safeBannerText = str => str.replace(/\\/g, '\\\\').replace(/'/g, '\u2019').replace(/%/g, '%%');
+      const maxTextW = Math.round(renderWidth * 0.9);  // 5% margin each side
+      const bannerVPad = 8;  // vertical padding inside banner (top + bottom)
+
+      // Per-clip font selection: map fontFamily → bold/semibold TTF files
+      const clipFamilyKey = (clip.bannerData.fontFamily || 'Inter').toLowerCase().replace(/\s+/g, '-');
+      const bannerFontFileMap = {
+        'inter':      ['temp-fonts/inter-700.ttf',       'temp-fonts/inter-600.ttf'],
+        'roboto':     ['temp-fonts/roboto-700.ttf',       'temp-fonts/roboto-400.ttf'],
+        'poppins':    ['temp-fonts/poppins-700.ttf',      'temp-fonts/poppins-400.ttf'],
+        'montserrat': ['temp-fonts/montserrat-700.ttf',   'temp-fonts/montserrat-400.ttf'],
+        'oswald':     ['temp-fonts/oswald-700.ttf',       'temp-fonts/oswald-400.ttf'],
+        'bebas-neue': ['temp-fonts/bebas-neue-400.ttf',   'temp-fonts/bebas-neue-400.ttf'],
+      };
+      const fontPair = bannerFontFileMap[clipFamilyKey] || bannerFontFileMap['inter'];
+      const clipFontBold = existsSync(fontPair[0]) ? fontPair[0] : bannerFontBold;
+      const clipFontSemi = existsSync(fontPair[1]) ? fontPair[1] : bannerFontSemi;
+
+      // Pre-compute all wrapped sub-lines before sizing the box
+      const bannerSubLines = [];
+      for (let i = 0; i < Math.min(lines.length, 3); i++) {
+        const fontSize = Math.round(renderHeight * (i === 0 ? 0.028 : 0.022));
+        const lineH = fontSize + Math.round(fontSize * 0.3);  // ~1.3× line height
+        const fontFile = i === 0 ? clipFontBold : clipFontSemi;
+        for (const subLine of wrapBannerLine(lines[i] || '', fontSize, maxTextW)) {
+          bannerSubLines.push({ text: subLine, fontSize, fontFile, lineH });
+        }
+      }
+
+      // Dynamic banner height: grows to fit all wrapped lines (min 10% of frame)
+      const totalBannerTextH = bannerSubLines.reduce((s, sl) => s + sl.lineH, 0);
+      const bannerH = Math.max(Math.round(renderHeight * 0.10), bannerVPad * 2 + totalBannerTextH);
+      const bannerY = renderHeight - bannerH;
+
+      // Background box flush to bottom
+      filterParts.push(`[${lastVideo}]drawbox=x=0:y=${bannerY}:w=${renderWidth}:h=${bannerH}:color=${safeColor}@0.92:t=fill:enable=${enable}[${safeLabelBase}box]`);
+      lastVideo = `${safeLabelBase}box`;
+
+      // Draw each sub-line top-to-bottom, centered horizontally
+      let bannerTextY = bannerY + bannerVPad;
+      for (let j = 0; j < bannerSubLines.length; j++) {
+        const { text, fontSize, fontFile, lineH } = bannerSubLines[j];
+        const safeText = safeBannerText(text);
+        const safeTextColor = textcolor.replace('#', '0x');
+        const label = `${safeLabelBase}t${j}`;
+        const fontOpt = fontFile ? `fontfile=${fontFile}:` : '';
+        filterParts.push(`[${lastVideo}]drawtext=${fontOpt}text='${safeText}':x=(${renderWidth}-text_w)/2:y=${bannerTextY}:fontsize=${fontSize}:fontcolor=${safeTextColor}:enable=${enable}[${label}]`);
+        lastVideo = label;
+        bannerTextY += lineH;
+      }
+      console.log(`[${sessionId}]   BANNER clip id=${clip.id} lines=${lines.length} at t=${clip.start}-${clip.start + clip.duration}`);
+    }
+
+    // === T1 CAPTION BURN-IN — generate ASS subtitle file with full styling + karaoke ===
+    // Applied as a second FFmpeg pass (after main render) for Windows compatibility.
+    let captionSubsPath = null;
+    const captionClips = clips.filter(c => c.trackId === 'T1');
+    if (captionClips.length > 0 && Object.keys(captionData).length > 0) {
+      // Read style from the first caption clip that has style data
+      const firstStyle = captionClips.map(c => captionData[c.id]?.style).find(Boolean) || {};
+      const isKaraoke = firstStyle.animation === 'karaoke';
+
+      // Convert hex #RRGGBB → ASS &H00BBGGRR (ASS uses BGR byte order)
+      const hexToAss = (hex) => {
+        const h = (hex || '#ffffff').replace('#', '').padEnd(6, '0');
+        return `&H00${h.slice(4, 6)}${h.slice(2, 4)}${h.slice(0, 2)}`;
+      };
+
+      const primaryColor   = hexToAss(firstStyle.color        || '#ffffff');
+      const outlineColor   = hexToAss(firstStyle.strokeColor   || '#000000');
+      const highlightColor = hexToAss(firstStyle.highlightColor || '#FFD700');
+      const bold    = (firstStyle.fontWeight === 'bold' || firstStyle.fontWeight === 'black') ? 1 : 0;
+      const outline = firstStyle.strokeWidth != null ? firstStyle.strokeWidth : 2;
+      // Scale CSS font size (designed for ~432px preview height) up to the actual render height
+      const fontsize = Math.round((firstStyle.fontSize || 48) * renderHeight / 432);
+      const fontname = firstStyle.fontFamily || 'Arial';
+
+      // Position → ASS alignment + vertical margin
+      const pos       = firstStyle.position || 'bottom';
+      const alignment = pos === 'top' ? 8 : pos === 'center' ? 5 : 2;
+      const marginV   = pos === 'bottom' ? Math.round(renderHeight * 0.25)
+                      : pos === 'top'    ? Math.round(renderHeight * 0.08)
+                      : 0;
+
+      // ASS time format: H:MM:SS.cc
+      const toAssTime = (sec) => {
+        const h  = Math.floor(sec / 3600);
+        const m  = Math.floor((sec % 3600) / 60);
+        const s  = Math.floor(sec % 60);
+        const cs = Math.round((sec % 1) * 100);
+        return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}.${String(cs).padStart(2,'0')}`;
+      };
+
+      const assHeader = [
+        '[Script Info]',
+        'ScriptType: v4.00+',
+        `PlayResX: ${renderWidth}`,
+        `PlayResY: ${renderHeight}`,
+        'WrapStyle: 0',
+        '',
+        '[V4+ Styles]',
+        'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
+        `Style: Default,${fontname},${fontsize},${primaryColor},${primaryColor},${outlineColor},&H80000000,${bold},0,0,0,100,100,0,0,1,${outline},0,${alignment},64,64,${marginV},1`,
+        '',
+        '[Events]',
+        'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
+      ].join('\n');
+
+      const assLines = [];
+      for (const clip of captionClips) {
+        const cd = captionData[clip.id];
+        if (!cd?.words?.length) continue;
+        const words = cd.words;
+        let chunk = [];
+        for (let i = 0; i < words.length; i++) {
+          chunk.push(words[i]);
+          const last = i === words.length - 1;
+          const gap  = !last && (words[i + 1].start - words[i].end) > 0.7;
+          if (last || gap || chunk.length >= 5) {
+            const chunkStart = clip.start + chunk[0].start;
+            const chunkEnd   = clip.start + chunk[chunk.length - 1].end;
+
+            if (isKaraoke) {
+              // Per-word highlight: one Dialogue event per word, showing full line
+              // with only the current word in highlightColor via inline \c override.
+              for (let wi = 0; wi < chunk.length; wi++) {
+                const w = chunk[wi];
+                const segStart = clip.start + w.start;
+                const segEnd   = clip.start + w.end;
+                const segText  = chunk.map((cw, ci) => {
+                  if (ci === wi) return `{\\c${highlightColor}&}${cw.text}{\\c${primaryColor}&}`;
+                  return cw.text;
+                }).join(' ');
+                assLines.push(`Dialogue: 0,${toAssTime(segStart)},${toAssTime(segEnd)},Default,,0,0,0,,${segText}`);
+              }
+              // Fill inter-word gaps with plain text (no word active)
+              for (let wi = 0; wi < chunk.length - 1; wi++) {
+                const gapStart = clip.start + chunk[wi].end;
+                const gapEnd   = clip.start + chunk[wi + 1].start;
+                if (gapEnd > gapStart + 0.01) {
+                  const gapText = chunk.map(cw => cw.text).join(' ');
+                  assLines.push(`Dialogue: 0,${toAssTime(gapStart)},${toAssTime(gapEnd)},Default,,0,0,0,,${gapText}`);
+                }
+              }
+            } else {
+              const text = chunk.map(w => w.text).join(' ');
+              assLines.push(`Dialogue: 0,${toAssTime(chunkStart)},${toAssTime(chunkEnd)},Default,,0,0,0,,${text}`);
+            }
+            chunk = [];
+          }
+        }
+      }
+
+      if (assLines.length > 0) {
+        captionSubsPath = join(session.rendersDir, `captions-${Date.now()}.ass`);
+        writeFileSync(captionSubsPath, assHeader + '\n' + assLines.join('\n'));
+        console.log(`[${sessionId}] Caption ASS: ${assLines.length} entries → ${captionSubsPath} (karaoke=${isKaraoke})`);
+      }
+    }
+
+    // Rename final video output
     filterParts.push(`[${lastVideo}]copy[vout]`);
 
-    // Audio mixing
-    let audioFilter = '';
-    if (audioClips.length > 0) {
-      const audioInputs = [];
-      for (const clip of audioClips) {
-        const asset = session.assets.get(clip.assetId);
-        if (!asset) continue;
+    // Process dedicated audio clips (A1, A2 tracks) via filter_complex (supports trim + delay)
+    const audioLabels = [];
+    for (const clip of audioClips) {
+      const asset = session.assets.get(clip.assetId);
+      if (!asset) continue;
 
-        inputs.push('-i', asset.path);
-        const idx = inputIndex++;
-        const inPoint = clip.inPoint || 0;
-        const outPoint = clip.outPoint || asset.duration;
+      inputs.push('-i', asset.path);
+      const idx = inputIndex++;
+      const inPoint = clip.inPoint || 0;
+      const outPoint = clip.outPoint || asset.duration;
+      const aLabel = `a${idx}`;
 
-        audioInputs.push(`[${idx}:a]atrim=${inPoint}:${outPoint},asetpts=PTS-STARTPTS,adelay=${Math.floor(clip.start * 1000)}|${Math.floor(clip.start * 1000)}[a${idx}]`);
-      }
-
-      if (audioInputs.length > 0) {
-        filterParts.push(...audioInputs);
-        const audioMix = audioInputs.map((_, i) => `[a${clips.indexOf(audioClips[i]) + videoClips.length}]`).join('');
-        filterParts.push(`${audioMix}amix=inputs=${audioInputs.length}[aout]`);
-        audioFilter = '-map [aout]';
-      }
+      filterParts.push(`[${idx}:a]atrim=${inPoint}:${outPoint},asetpts=PTS-STARTPTS,adelay=${Math.floor(clip.start * 1000)}|${Math.floor(clip.start * 1000)}[${aLabel}]`);
+      audioLabels.push(aLabel);
     }
 
+    // Audio output strategy:
+    // - If A1/A2 clips exist → mix them via filter_complex (handles trim + delay)
+    // - Otherwise → map V1 embedded audio directly with optional flag (safe even if V1 is muted)
+    // Never extract audio from V2/V3 via filter_complex (animations may have no audio stream)
+    let audioMapArgs = [];
+    if (audioLabels.length === 1) {
+      filterParts.push(`[${audioLabels[0]}]anull[aout]`);
+      audioMapArgs = ['-map', '[aout]'];
+    } else if (audioLabels.length > 1) {
+      const mix = audioLabels.map(l => `[${l}]`).join('');
+      filterParts.push(`${mix}amix=inputs=${audioLabels.length}:normalize=0[aout]`);
+      audioMapArgs = ['-map', '[aout]'];
+    } else if (v1InputIdx >= 0) {
+      // No dedicated audio clips — map V1 audio directly (? = optional, won't fail if muted)
+      audioMapArgs = ['-map', `${v1InputIdx}:a?`];
+    }
+
+    console.log(`[${sessionId}] Audio: audioLabels=${audioLabels.length} v1InputIdx=${v1InputIdx} audioMapArgs=${audioMapArgs.join(' ')}`);
+
     // Build final command
-    const outputPath = join(session.rendersDir, isPreview ? 'preview.mp4' : `export-${Date.now()}.mp4`);
+    const finalOutputPath = join(session.rendersDir, isPreview ? 'preview.mp4' : `export-${Date.now()}.mp4`);
+    // If captions exist, render to a temp file first, then apply subtitles in a second pass
+    const outputPath = captionSubsPath ? join(session.rendersDir, `temp-${Date.now()}.mp4`) : finalOutputPath;
+
+    // Write filter_complex to a temp file to avoid Windows argument quoting issues with special chars
+    const filterComplexPath = join(session.rendersDir, `fc-${Date.now()}.txt`);
+    writeFileSync(filterComplexPath, filterParts.join(';'));
 
     const ffmpegArgs = [
       '-y',
       ...inputs,
-      '-filter_complex', filterParts.join(';'),
+      '-/filter_complex', filterComplexPath,
       '-map', '[vout]',
+      ...audioMapArgs,
     ];
-
-    if (audioFilter) {
-      ffmpegArgs.push('-map', '[aout]');
-    }
 
     // Encoding settings
     if (isPreview) {
@@ -2043,17 +2305,47 @@ async function handleProjectRender(req, res, sessionId) {
       ffmpegArgs.push('-c:v', 'libx264', '-preset', 'medium', '-crf', '18');
     }
 
-    ffmpegArgs.push('-c:a', 'aac', '-b:a', '192k');
+    if (audioMapArgs.length > 0) {
+      ffmpegArgs.push('-c:a', 'aac', '-b:a', '192k');
+    }
     ffmpegArgs.push('-movflags', '+faststart');
     ffmpegArgs.push('-t', totalDuration.toString());
     ffmpegArgs.push(outputPath);
 
     console.log(`[${sessionId}] FFmpeg render command prepared`);
+    console.log(`[${sessionId}] filter_complex:\n${filterParts.join(';')}`);
+    operationProgress.set(sessionId, { progress: 2, operation: 'export', status: 'encoding' });
 
-    await runFFmpeg(ffmpegArgs, sessionId);
+    try {
+      await runFFmpeg(ffmpegArgs, sessionId, { totalDuration, operation: 'export' });
+    } finally {
+      try { unlinkSync(filterComplexPath); } catch {}
+    }
+
+    // Apply captions as a second pass using -vf ass (avoids filter_complex escaping issues on Windows)
+    if (captionSubsPath) {
+      console.log(`[${sessionId}] Applying captions (second pass, ASS)...`);
+      operationProgress.set(sessionId, { progress: 90, operation: 'export', status: 'adding captions' });
+      const subsEscaped = captionSubsPath.replace(/\\/g, '/').replace(/^([A-Za-z]):/, '$1\\:');
+      // fontsdir points libass to our pre-downloaded caption fonts (Inter, Roboto, Poppins, etc.)
+      // so font names in the ASS Fontname field resolve correctly instead of falling back to default
+      const fontsDirEscaped = 'temp-fonts';
+      const captionArgs = [
+        '-y',
+        '-i', outputPath,
+        '-vf', `ass='${subsEscaped}':fontsdir='${fontsDirEscaped}'`,
+        '-c:v', 'libx264', '-preset', isPreview ? 'ultrafast' : 'medium', '-crf', isPreview ? '28' : '18',
+        '-c:a', 'copy',
+        '-movflags', '+faststart',
+        finalOutputPath,
+      ];
+      await runFFmpeg(captionArgs, sessionId, {});
+      try { unlinkSync(outputPath); } catch {}
+      try { unlinkSync(captionSubsPath); } catch {}
+    }
 
     const { stat } = await import('fs/promises');
-    const outputStats = await stat(outputPath);
+    const outputStats = await stat(finalOutputPath);
 
     console.log(`[${sessionId}] Render complete: ${(outputStats.size / 1024 / 1024).toFixed(1)} MB`);
     console.log(`[${sessionId}] === RENDER COMPLETE ===\n`);
@@ -2061,7 +2353,7 @@ async function handleProjectRender(req, res, sessionId) {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({
       success: true,
-      path: outputPath,
+      path: finalOutputPath,
       size: outputStats.size,
       duration: totalDuration,
       downloadUrl: `/session/${sessionId}/renders/${isPreview ? 'preview' : 'export'}`,
@@ -2084,7 +2376,6 @@ async function handleRenderDownload(req, res, sessionId, renderType) {
   }
 
   // Find the render file
-  const { readdirSync } = require('fs');
   const files = readdirSync(session.rendersDir);
 
   let renderFile;
@@ -2108,7 +2399,23 @@ async function handleRenderDownload(req, res, sessionId, renderType) {
   const { stat } = await import('fs/promises');
   const stats = await stat(renderPath);
 
-  const filename = renderType === 'preview' ? 'preview.mp4' : `${session.originalName.replace(/\.[^.]+$/, '')}-export.mp4`;
+  const projectName = (session.project?.projectFilename || session.originalName || 'export')
+    .replace(/\.[^.]+$/, '')
+    .replace(/\s+/g, '_');
+
+  // Compute format label from optional ?w=&h= query params
+  let formatSuffix = '_export';
+  if (renderType !== 'preview') {
+    const urlParsed = new URL(req.url, 'http://localhost');
+    const qw = parseInt(urlParsed.searchParams.get('w') || '0', 10);
+    const qh = parseInt(urlParsed.searchParams.get('h') || '0', 10);
+    if (qw > 0 && qh > 0) {
+      const gcdFn = (a, b) => b === 0 ? a : gcdFn(b, a % b);
+      const g = gcdFn(qw, qh);
+      formatSuffix = `_export_${qw / g}:${qh / g}`;
+    }
+  }
+  const filename = renderType === 'preview' ? 'preview.mp4' : `${projectName}${formatSuffix}.mp4`;
 
   res.writeHead(200, {
     'Content-Type': 'video/mp4',
@@ -2669,13 +2976,64 @@ async function checkLocalWhisper() {
   });
 }
 
+// Analyze a few video frames with Gemini to extract subject/vocabulary context for Whisper.
+// Returns a short sentence suitable as Whisper's initial_prompt.
+async function analyzeVideoContext(videoPath, duration, jobId) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+
+  const frameDir = join(tmpdir(), `ctx-frames-${jobId}`);
+  mkdirSync(frameDir, { recursive: true });
+
+  try {
+    // Sample 4 frames spread across the video
+    const timestamps = [0.1, 0.3, 0.55, 0.8].map(r => Math.max(1, parseFloat((r * duration).toFixed(1))));
+    const framePaths = timestamps.map((t, i) => ({ t, path: join(frameDir, `f${i}.jpg`) }));
+
+    await Promise.all(framePaths.map(({ t, path }) =>
+      runFFmpeg(['-y', '-ss', String(t), '-i', videoPath, '-vframes', '1', '-q:v', '4', path], jobId).catch(() => null)
+    ));
+
+    const validFrames = framePaths.filter(({ path }) => existsSync(path));
+    if (validFrames.length === 0) return null;
+
+    const ai = new GoogleGenAI({ apiKey });
+    const parts = validFrames.map(({ path }) => ({
+      inlineData: { mimeType: 'image/jpeg', data: readFileSync(path).toString('base64') }
+    }));
+    parts.push({ text: `Analyze these video frames and describe what this video is about in a single sentence optimized as a speech recognition context hint. Include: the main topic, domain/field, and key technical terms, proper nouns, or domain-specific vocabulary (especially words that might be misheard). Example output: "A nature documentary about maritime pine trees, sylviculture, and forest management in southwest France." Only output the one sentence, nothing else.` });
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [{ role: 'user', parts }],
+    });
+    const context = response.text?.trim();
+    if (context) {
+      console.log(`[${jobId}] Video context for Whisper: "${context}"`);
+    }
+    return context || null;
+  } catch (e) {
+    console.warn(`[${jobId}] Video context analysis failed (non-fatal):`, e.message);
+    return null;
+  } finally {
+    try {
+      if (existsSync(frameDir)) {
+        for (const f of readdirSync(frameDir)) { try { unlinkSync(join(frameDir, f)); } catch (_) {} }
+        rmdirSync(frameDir);
+      }
+    } catch (_) {}
+  }
+}
+
 // Run local Whisper transcription
-async function runLocalWhisper(audioPath, jobId) {
+async function runLocalWhisper(audioPath, jobId, initialPrompt = null) {
   const scriptPath = join(process.cwd(), 'scripts', 'whisper-transcribe.py');
 
   return new Promise((resolve, reject) => {
     console.log(`[${jobId}] Running local Whisper...`);
-    const whisperProcess = spawn('python3', [scriptPath, audioPath, 'base']);
+    const args = [scriptPath, audioPath, 'base'];
+    if (initialPrompt) args.push(initialPrompt);
+    const whisperProcess = spawn('python3', args);
 
     let stdout = '';
     let stderr = '';
@@ -2759,7 +3117,7 @@ async function getOrTranscribeVideo(session, videoAsset, jobId) {
     const audioBase64 = audioBuffer.toString('base64');
 
     const result = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-2.5-flash',
       contents: [{
         role: 'user',
         parts: [
@@ -2789,7 +3147,6 @@ async function getOrTranscribeVideo(session, videoAsset, jobId) {
     }
   } else if (openaiKey) {
     console.log(`[${jobId}] Using OpenAI Whisper API...`);
-    const { FormData, File } = await import('formdata-node');
     const audioBuffer = readFileSync(audioPath);
     const formData = new FormData();
     formData.append('file', new File([audioBuffer], 'audio.mp3', { type: 'audio/mp3' }));
@@ -2920,6 +3277,157 @@ function extractNumericValue(valueStr) {
   return result;
 }
 
+// Post-process a Whisper transcript using Gemini (vision + full transcript) to fix semantic errors.
+// Returns targeted JSON corrections so timestamps are never disturbed and word count never changes.
+async function correctTranscriptWithContext(words, videoPath, duration, language, jobId) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey || words.length === 0) return words;
+
+  const frameDir = join(tmpdir(), `corr-frames-${jobId}`);
+  mkdirSync(frameDir, { recursive: true });
+
+  try {
+    // Sample 5 frames spread across the video
+    const timestamps = [0.05, 0.25, 0.5, 0.75, 0.92].map(r =>
+      Math.max(1, Math.min(duration - 1, parseFloat((r * duration).toFixed(1))))
+    );
+    const framePaths = timestamps.map((t, i) => ({ t, path: join(frameDir, `f${i}.jpg`) }));
+    await Promise.all(framePaths.map(({ t, path }) =>
+      runFFmpeg(['-y', '-ss', String(t), '-i', videoPath, '-vframes', '1', '-q:v', '4', path], jobId)
+        .catch(() => null)
+    ));
+
+    const validFrames = framePaths.filter(({ path }) => existsSync(path));
+
+    // Build indexed word list for Gemini to reference by position
+    const indexedTranscript = words.map((w, i) => `[${i}] ${w.text}`).join(' ');
+    const fullTranscript = words.map(w => w.text).join(' ');
+    const langName = language || 'unknown';
+
+    const ai = new GoogleGenAI({ apiKey });
+    const parts = validFrames.map(({ path }) => ({
+      inlineData: { mimeType: 'image/jpeg', data: readFileSync(path).toString('base64') },
+    }));
+
+    parts.push({ text: `You are a speech-to-text correction assistant. Your job is to find and fix transcription errors caused by homophones or misheard domain-specific words.
+
+DETECTED LANGUAGE: ${langName}
+
+CONTEXT SOURCES (use ALL of these to understand the subject):
+1. The video frames above (visual subject matter)
+2. The full transcript below (global topic and vocabulary from what was actually said)
+
+FULL TRANSCRIPT (for global context):
+"${fullTranscript}"
+
+INDEXED WORD LIST (use these indices for corrections):
+${indexedTranscript}
+
+RULES:
+- Only correct words that are clearly wrong given the visual AND textual context combined
+- Every replacement MUST be a real, existing word in ${langName} — never invent words
+- Only fix homophones, misheard technical terms, or proper nouns — do NOT rephrase or rewrite
+- If you are not confident, do NOT include the correction
+- Return a JSON array of corrections, or [] if nothing to fix
+
+RESPONSE FORMAT (JSON only, no explanation):
+[{"index": 5, "original": "pains", "corrected": "pins"}, {"index": 6, "original": "maritimes", "corrected": "maritimes"}]` });
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [{ role: 'user', parts }],
+      config: { responseMimeType: 'application/json' },
+    });
+
+    const responseText = response.text?.trim();
+    if (!responseText) return words;
+
+    let corrections;
+    try {
+      corrections = JSON.parse(responseText);
+    } catch {
+      const match = responseText.match(/\[[\s\S]*\]/);
+      corrections = match ? JSON.parse(match[0]) : [];
+    }
+
+    if (!Array.isArray(corrections) || corrections.length === 0) {
+      console.log(`[${jobId}] Transcript correction: no changes needed`);
+      return words;
+    }
+
+    // Apply corrections by index — timestamps untouched
+    const result = [...words];
+    const applied = [];
+    for (const fix of corrections) {
+      const idx = fix.index;
+      if (typeof idx !== 'number' || idx < 0 || idx >= result.length) continue;
+      if (result[idx].text.toLowerCase() !== (fix.original || '').toLowerCase()) continue; // sanity check
+      applied.push(`"${result[idx].text}"→"${fix.corrected}"`);
+      result[idx] = { ...result[idx], text: fix.corrected };
+    }
+
+    if (applied.length > 0) {
+      console.log(`[${jobId}] Transcript corrections applied: ${applied.join(', ')}`);
+    } else {
+      console.log(`[${jobId}] Transcript correction: no valid corrections matched`);
+    }
+
+    return result;
+  } catch (e) {
+    console.warn(`[${jobId}] Transcript correction failed (non-fatal):`, e.message);
+    return words;
+  } finally {
+    try {
+      if (existsSync(frameDir)) {
+        for (const f of readdirSync(frameDir)) { try { unlinkSync(join(frameDir, f)); } catch (_) {} }
+        rmdirSync(frameDir);
+      }
+    } catch (_) {}
+  }
+}
+
+// Normalize transcription words: merge apostrophe fragments and French elisions.
+// Handles three cases:
+//   1. "c'" + "est"  → "c'est"  (Whisper splits after apostrophe)
+//   2. "c"  + "'est" → "c'est"  (Whisper splits before apostrophe)
+//   3. "c"  + "est"  → "c'est"  (Whisper drops apostrophe entirely — French elision heuristic)
+function normalizeFrenchWords(words) {
+  // French words that elide before a vowel or h
+  const ELISION_PREFIXES = new Set(['c', 'd', 'j', 'l', 'm', 'n', 'qu', 'que', 's', 't', 'y']);
+  const VOWEL_OR_H = /^[aeiouhâêîôûàèùéœæAEIOUHÂÊÎÔÛÀÈÙÉŒÆ]/;
+  // Both straight (') and curly (') apostrophes
+  const APOS = /['\u2019]/;
+
+  const result = [];
+  let i = 0;
+  while (i < words.length) {
+    const w = words[i];
+    const next = words[i + 1];
+    if (next) {
+      const wText = w.text;
+      const nText = next.text;
+      // Case 1: current word ends with apostrophe → glue to next word
+      if (APOS.test(wText.slice(-1))) {
+        result.push({ text: wText + nText, start: w.start, end: next.end });
+        i += 2; continue;
+      }
+      // Case 2: next word starts with apostrophe → glue to current word
+      if (APOS.test(nText[0])) {
+        result.push({ text: wText + nText, start: w.start, end: next.end });
+        i += 2; continue;
+      }
+      // Case 3: French elision — prefix + vowel/h word (apostrophe completely missing)
+      if (ELISION_PREFIXES.has(wText.toLowerCase()) && VOWEL_OR_H.test(nText)) {
+        result.push({ text: wText + "'" + nText, start: w.start, end: next.end });
+        i += 2; continue;
+      }
+    }
+    result.push(w);
+    i++;
+  }
+  return result;
+}
+
 async function handleTranscribe(req, res, sessionId) {
   const session = getSession(sessionId);
   if (!session) {
@@ -3004,6 +3512,10 @@ async function handleTranscribe(req, res, sessionId) {
     const totalDuration = await getVideoDuration(videoAsset.path);
     console.log(`[${jobId}] Video duration: ${totalDuration.toFixed(2)}s`);
 
+    // Analyze video content to build a context hint for Whisper (improves domain-specific accuracy)
+    console.log(`[${jobId}] Analyzing video context for transcription accuracy...`);
+    const videoContext = await analyzeVideoContext(videoAsset.path, totalDuration, jobId);
+
     // Extract audio as MP3
     console.log(`[${jobId}] Extracting audio...`);
     await runFFmpeg([
@@ -3023,7 +3535,7 @@ async function handleTranscribe(req, res, sessionId) {
     if (useLocalWhisper) {
       // === Local Whisper - Free and accurate word-level timestamps ===
       try {
-        transcription = await runLocalWhisper(audioPath, jobId);
+        transcription = await runLocalWhisper(audioPath, jobId, videoContext);
         console.log(`[${jobId}] Local Whisper complete: ${transcription.words?.length || 0} words`);
       } catch (whisperError) {
         console.log(`[${jobId}] Local Whisper failed: ${whisperError.message}`);
@@ -3034,11 +3546,12 @@ async function handleTranscribe(req, res, sessionId) {
           const audioBase64 = audioBuffer.toString('base64');
           const ai = new GoogleGenAI({ apiKey: geminiKey });
 
+          const contextHint = videoContext ? ` Context: ${videoContext}` : '';
           const response = await ai.models.generateContent({
-            model: 'gemini-2.0-flash',
+            model: 'gemini-2.5-flash',
             contents: [{ role: 'user', parts: [
               { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
-              { text: `Transcribe this audio with word-level timestamps. Duration: ${totalDuration.toFixed(1)}s. Return JSON: {"text": "full text", "words": [{"text": "word", "start": 0.0, "end": 0.5}]}` }
+              { text: `Transcribe this audio with word-level timestamps. Duration: ${totalDuration.toFixed(1)}s.${contextHint} Return JSON: {"text": "full text", "words": [{"text": "word", "start": 0.0, "end": 0.5}]}` }
             ]}]
           });
 
@@ -3059,15 +3572,12 @@ async function handleTranscribe(req, res, sessionId) {
       console.log(`[${jobId}] Sending to OpenAI Whisper for transcription...`);
       const audioBuffer = readFileSync(audioPath);
 
-      // Create FormData for multipart upload
-      const FormData = (await import('formdata-node')).FormData;
-      const { Blob } = await import('buffer');
-
       const formData = new FormData();
-      formData.append('file', new Blob([audioBuffer], { type: 'audio/mp3' }), 'audio.mp3');
+      formData.append('file', new File([audioBuffer], 'audio.mp3', { type: 'audio/mp3' }));
       formData.append('model', 'whisper-1');
       formData.append('response_format', 'verbose_json');
       formData.append('timestamp_granularities[]', 'word');
+      if (videoContext) formData.append('prompt', videoContext);
 
       const whisperResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
         method: 'POST',
@@ -3104,7 +3614,7 @@ async function handleTranscribe(req, res, sessionId) {
       const ai = new GoogleGenAI({ apiKey: geminiKey });
 
       const response = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
+        model: 'gemini-2.5-flash',
         contents: [
           {
             role: 'user',
@@ -3116,7 +3626,7 @@ async function handleTranscribe(req, res, sessionId) {
                 }
               },
               {
-                text: `Transcribe this audio with word-level timestamps. The audio is ${totalDuration.toFixed(1)} seconds long.
+                text: `Transcribe this audio with word-level timestamps. The audio is ${totalDuration.toFixed(1)} seconds long.${videoContext ? ` Context: ${videoContext}` : ''}
 
 IMPORTANT: Return ONLY valid JSON, no markdown, no explanation. The response must be parseable JSON.
 
@@ -3194,17 +3704,27 @@ Guidelines:
     // Cleanup
     try { unlinkSync(audioPath); } catch {}
 
-    const words = (transcription.words || []).map(w => ({
+    const rawWords = (transcription.words || []).map(w => ({
       text: w.text || '',
       start: parseFloat(w.start) || 0,
       end: parseFloat(w.end) || 0,
     })).filter(w => w.text.trim().length > 0); // Filter out empty words
 
+    const words = normalizeFrenchWords(rawWords);
+    if (words.length !== rawWords.length) {
+      console.log(`[${jobId}] Apostrophe normalization: ${rawWords.length} → ${words.length} words`);
+    }
+
     console.log(`[${jobId}] Transcription complete: ${words.length} words`);
     console.log(`[${jobId}] Text: "${(transcription.text || '').substring(0, 200)}..."`);
 
+    // Post-process: correct semantic/homophone errors using Gemini vision + full transcript
+    const detectedLanguage = transcription.language || 'unknown';
+    console.log(`[${jobId}] Running semantic correction (language: ${detectedLanguage})...`);
+    const correctedWords = await correctTranscriptWithContext(words, videoAsset.path, totalDuration, detectedLanguage, jobId);
+
     // Check if transcription is empty
-    if (words.length === 0 && (!transcription.text || transcription.text.trim().length === 0)) {
+    if (correctedWords.length === 0 && (!transcription.text || transcription.text.trim().length === 0)) {
       console.error(`[${jobId}] Empty transcription - Gemini returned no words`);
       console.error(`[${jobId}] This could mean: no speech in video, audio too quiet, or unsupported language`);
 
@@ -3224,8 +3744,8 @@ Guidelines:
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({
       success: true,
-      text: transcription.text || '',
-      words: words,
+      text: correctedWords.map(w => w.text).join(' '),
+      words: correctedWords,
       duration: totalDuration,
     }));
 
@@ -3342,7 +3862,7 @@ async function analyzeBrollOpportunities(transcript, words, totalDuration, apiKe
   const ai = new GoogleGenAI({ apiKey });
 
   const response = await ai.models.generateContent({
-    model: 'gemini-2.0-flash',
+    model: 'gemini-2.5-flash',
     contents: [{
       role: 'user',
       parts: [{
@@ -3527,7 +4047,7 @@ async function handleGenerateBroll(req, res, sessionId) {
         const audioBase64 = audioBuffer.toString('base64');
         const ai = new GoogleGenAI({ apiKey });
         const response = await ai.models.generateContent({
-          model: 'gemini-2.0-flash',
+          model: 'gemini-2.5-flash',
           contents: [{ role: 'user', parts: [
             { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
             { text: `Transcribe this audio with word timestamps. Duration: ${totalDuration}s. Return JSON: {"text": "...", "words": [{"text": "word", "start": 0.0, "end": 0.5}]}` }
@@ -3580,7 +4100,7 @@ async function handleGenerateBroll(req, res, sessionId) {
 
       const ai = new GoogleGenAI({ apiKey });
       const response = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
+        model: 'gemini-2.5-flash',
         contents: [{
           role: 'user',
           parts: [
@@ -3869,7 +4389,7 @@ async function handleGenerateAnimation(req, res, sessionId) {
 
               const ai = new GoogleGenAI({ apiKey });
               const segmentResult = await ai.models.generateContent({
-                model: 'gemini-2.0-flash',
+                model: 'gemini-2.5-flash',
                 contents: [{
                   role: 'user',
                   parts: [{
@@ -4179,7 +4699,7 @@ ${attachedAssetIds?.length ? `- IMPORTANT: Include media scenes to showcase the 
 - For videos, consider using slow-mo (videoPlaybackRate: 0.5) for dramatic moments` : ''}`;
 
     const result = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-2.5-flash',
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
     });
 
@@ -4998,7 +5518,7 @@ User: "a peaceful forest"
 Enhanced: "Ancient moss-covered forest with towering redwood trees, ethereal morning mist weaving between massive trunks, soft dappled sunlight filtering through the dense canopy, ferns and wildflowers carpeting the forest floor, a gentle stream with crystal-clear water, mystical and serene atmosphere, nature photography style, rich greens and earth tones, depth and scale, photorealistic, National Geographic quality"`;
 
         const result = await ai.models.generateContent({
-          model: 'gemini-2.0-flash',
+          model: 'gemini-2.5-flash',
           contents: [{
             role: 'user',
             parts: [{ text: `Enhance this image prompt:\n\n"${prompt}"` }]
@@ -5204,7 +5724,7 @@ Input: "zoom out"
 Output: "Epic reveal shot with slow cinematic zoom out, camera gently pulling back to reveal the full scene, subtle atmospheric haze and soft light flares, smooth dolly movement with slight vertical lift"`;
 
         const result = await ai.models.generateContent({
-          model: 'gemini-2.0-flash',
+          model: 'gemini-2.5-flash',
           contents: [
             { role: 'user', parts: [{ text: systemPrompt }] },
             { role: 'user', parts: [{ text: `Enhance this video motion prompt: "${prompt}"` }] }
@@ -5409,7 +5929,7 @@ async function handleRestyleVideo(req, res, sessionId) {
         const ai = new GoogleGenAI({ apiKey: geminiApiKey });
 
         const result = await ai.models.generateContent({
-          model: 'gemini-2.0-flash',
+          model: 'gemini-2.5-flash',
           contents: [{
             role: 'user',
             parts: [{
@@ -5821,7 +6341,7 @@ async function handleGenerateBatchAnimations(req, res, sessionId) {
 
     const ai = new GoogleGenAI({ apiKey });
     const planResult = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-2.5-flash',
       contents: [{
         role: 'user',
         parts: [{
@@ -5895,7 +6415,7 @@ Guidelines:
 
       // Generate scene data with Gemini
       const sceneResult = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
+        model: 'gemini-2.5-flash',
         contents: [{
           role: 'user',
           parts: [{
@@ -6181,7 +6701,7 @@ async function handleAnalyzeForAnimation(req, res, sessionId) {
       const audioBase64 = audioBuffer.toString('base64');
 
       const result = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
+        model: 'gemini-2.5-flash',
         contents: [{
           role: 'user',
           parts: [
@@ -6330,7 +6850,7 @@ Use specific terms, concepts, and themes from the transcript.
 Feel free to add a GIF scene for reactions or emphasis when appropriate!`;
 
     const sceneResult = await genAI.models.generateContent({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-2.5-flash',
       contents: [{ role: 'user', parts: [{ text: scenePrompt }] }],
     });
 
@@ -6688,7 +7208,7 @@ async function handleGenerateTranscriptAnimation(req, res, sessionId) {
       const audioBase64 = audioBuffer.toString('base64');
       const ai = new GoogleGenAI({ apiKey });
       const geminiResponse = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
+        model: 'gemini-2.5-flash',
         contents: [{ role: 'user', parts: [
           { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
           { text: `Transcribe this audio with word timestamps. Duration: ${totalDuration}s. Return JSON: {"text": "...", "words": [{"text": "word", "start": 0.0, "end": 0.5}]}` }
@@ -6783,7 +7303,7 @@ Return JSON array of phrases to animate:
 Pick phrases that are spread throughout the video. Each phrase should be 2-6 words.`;
 
     const analysisResponse = await ai.models.generateContent({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-2.5-flash',
       contents: [{ role: 'user', parts: [{ text: analysisPrompt }] }]
     });
 
@@ -7054,7 +7574,7 @@ async function handleGenerateContextualAnimation(req, res, sessionId) {
       const audioBase64 = audioBuffer.toString('base64');
 
       const result = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
+        model: 'gemini-2.5-flash',
         contents: [{
           role: 'user',
           parts: [
@@ -7184,7 +7704,7 @@ IMPORTANT: The animation content should directly relate to the video's actual to
 Use specific terms, concepts, and themes from the transcript.`;
 
     const sceneResult = await genAI.models.generateContent({
-      model: 'gemini-2.0-flash',
+      model: 'gemini-2.5-flash',
       contents: [{ role: 'user', parts: [{ text: scenePrompt }] }],
     });
 
@@ -7624,6 +8144,485 @@ async function handleProcessAsset(req, res, sessionId) {
   }
 }
 
+// Detect a lower-third banner in the video using Gemini vision.
+// Returns { lines, bgcolor, textcolor } or null if none found.
+// Detect ALL lower-third banners throughout a video by sampling frames every N seconds.
+// Returns an array of segments: [{ lines, bgcolor, textcolor, startTime, endTime }, ...]
+async function detectAllLowerThirdBanners(videoPath, duration, jobId) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return [];
+
+  const sampleInterval = 2; // sample every 2 seconds
+  const timestamps = [];
+  for (let t = 1; t < duration; t += sampleInterval) {
+    timestamps.push(parseFloat(Math.min(t, duration - 0.5).toFixed(2)));
+  }
+  if (timestamps.length === 0) return [];
+
+  const frameDir = join(tmpdir(), `lt-frames-${jobId}`);
+  mkdirSync(frameDir, { recursive: true });
+
+  try {
+    // Extract frames in parallel batches of 8
+    const framePaths = timestamps.map((t, i) => ({ t, path: join(frameDir, `f${i}.jpg`) }));
+    const extractBatchSize = 8;
+    for (let i = 0; i < framePaths.length; i += extractBatchSize) {
+      await Promise.all(
+        framePaths.slice(i, i + extractBatchSize).map(({ t, path }) =>
+          runFFmpeg(['-y', '-ss', String(t), '-i', videoPath, '-vframes', '1', '-q:v', '3', path], jobId)
+            .catch(() => null) // ignore frames near end of video
+        )
+      );
+    }
+
+    // Analyze frames with Gemini, 6 images per API call, 3 calls in parallel
+    const ai = new GoogleGenAI({ apiKey });
+    const geminiBatchSize = 6;
+    const allDetections = new Array(timestamps.length).fill(null);
+
+    const geminiBatches = [];
+    for (let i = 0; i < framePaths.length; i += geminiBatchSize) {
+      geminiBatches.push({ startIdx: i, items: framePaths.slice(i, i + geminiBatchSize) });
+    }
+
+    const analyzeBatch = async ({ startIdx, items }) => {
+      const validItems = items.filter(({ path }) => existsSync(path));
+      if (validItems.length === 0) return;
+
+      const batchTs = validItems.map(({ t }) => `${t}s`).join(', ');
+      const parts = [];
+      for (const { path } of validItems) {
+        parts.push({ inlineData: { mimeType: 'image/jpeg', data: readFileSync(path).toString('base64') } });
+      }
+      parts.push({ text: `Analyze these ${validItems.length} video frames taken at timestamps: ${batchTs}.
+For each frame (0-indexed), detect if there is a lower-third banner — a colored rectangular bar in the bottom ~25% of the frame containing text such as a person's name and/or title/role.
+Respond with a JSON array of exactly ${validItems.length} objects, one per frame in order:
+[{"found":false},{"found":true,"lines":["Name","Title"],"bgcolor":"#RRGGBB","textcolor":"#RRGGBB"},...]
+Rules: include at most 2 non-empty text lines; use hex colors. Only respond with valid JSON array, nothing else.` });
+
+      try {
+        const response = await ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: [{ role: 'user', parts }],
+          config: { responseMimeType: 'application/json' },
+        });
+        const text = response.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+        if (!text) return;
+        const results = JSON.parse(text);
+        if (!Array.isArray(results)) return;
+        results.forEach((r, localIdx) => {
+          if (localIdx >= validItems.length) return;
+          const globalIdx = startIdx + items.indexOf(validItems[localIdx]);
+          if (globalIdx >= 0 && globalIdx < allDetections.length) {
+            allDetections[globalIdx] = r.found
+              ? { lines: (r.lines || []).filter(l => typeof l === 'string' && l.trim()), bgcolor: r.bgcolor, textcolor: r.textcolor }
+              : null;
+          }
+        });
+      } catch (e) {
+        console.warn(`[${jobId}] Banner batch (startIdx=${startIdx}) failed:`, e.message);
+      }
+    };
+
+    const concurrency = 3;
+    for (let i = 0; i < geminiBatches.length; i += concurrency) {
+      await Promise.all(geminiBatches.slice(i, i + concurrency).map(analyzeBatch));
+    }
+
+    // Merge consecutive detections with the same primary line into time segments
+    const validHex = /^#[0-9a-fA-F]{6}$/;
+    const segments = [];
+    let current = null;
+
+    for (let i = 0; i < timestamps.length; i++) {
+      const t = timestamps[i];
+      const det = allDetections[i];
+
+      if (!det || det.lines.length === 0) {
+        if (current) { segments.push(current); current = null; }
+        continue;
+      }
+
+      const key = det.lines[0]; // primary line identifies the banner
+      if (current && current._key === key) {
+        // Extend current segment to cover this sample + half interval ahead
+        current.endTime = Math.min(t + sampleInterval / 2, duration);
+      } else {
+        if (current) segments.push(current);
+        current = {
+          lines: det.lines,
+          bgcolor: validHex.test(det.bgcolor) ? det.bgcolor : '#1a2a4a',
+          textcolor: validHex.test(det.textcolor) ? det.textcolor : '#ffffff',
+          startTime: Math.max(0, t - sampleInterval / 2),
+          endTime: Math.min(t + sampleInterval / 2, duration),
+          _key: key,
+        };
+      }
+    }
+    if (current) segments.push(current);
+
+    // Strip internal _key before returning
+    const result = segments.map(({ _key, ...s }) => s);
+    console.log(`[${jobId}] Lower-third scan: ${timestamps.length} frames → ${result.length} banner segment(s)`);
+    result.forEach(s => console.log(`[${jobId}]   "${s.lines.join(' / ')}" ${s.startTime.toFixed(1)}s–${s.endTime.toFixed(1)}s`));
+    return result;
+  } catch (e) {
+    console.warn(`[${jobId}] Lower-third detection failed:`, e.message);
+    return [];
+  } finally {
+    try {
+      if (existsSync(frameDir)) {
+        for (const f of readdirSync(frameDir)) { try { unlinkSync(join(frameDir, f)); } catch (_) {} }
+        rmdirSync(frameDir);
+      }
+    } catch (_) {}
+  }
+}
+
+// Build FFmpeg filter fragments to overlay all lower-third banner segments.
+// Returns a filter string intended to be written to a filter-script FILE (via -filter_script:v).
+// \, in enable= values = literal \, bytes in the file → FFmpeg's parser reads as escaped comma.
+// Fonts: copied to a relative path (no C: drive letter) so fontfile= parses without escaping issues.
+// Text auto-wraps into multiple drawtext calls to fit within the cropped frame width.
+function buildAllLowerThirdFilters(segments, cropW) {
+  if (!segments || segments.length === 0) return '';
+
+  // normalize: strip accents + non-ASCII; replace only chars that break OUTSIDE of quoted values.
+  // Apostrophes are kept here so "d'Anglet" stays one word for accurate wrapping.
+  const normalize = str => String(str)
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\x20-\x7e]/g, ' ')
+    .replace(/:/g, ' ')    // colon is always an option separator (even inside single quotes)
+    .replace(/\\/g, '')
+    .replace(/\s+/g, ' ').trim();
+
+  // ffEscape: make text safe inside a single-quoted drawtext text='...' value.
+  // '  →  '\'':  close-quote, backslash-escaped literal quote, reopen-quote (standard FFmpeg trick)
+  // %  →  %%:   prevent drawtext from expanding %{pts} / %{frame_num} format specifiers
+  const ffEscape = str => str.replace(/'/g, "'\\''").replace(/%/g, '%%');
+
+  // Word-wrap text into lines that fit within maxWidth pixels (Arial ≈ 0.58× char width).
+  const wrapText = (text, fontsize, maxWidth) => {
+    const maxChars = Math.max(10, Math.floor(maxWidth / (fontsize * 0.58)));
+    if (text.length <= maxChars) return [text];
+    const lines = [];
+    let cur = '';
+    for (const word of text.split(' ')) {
+      const candidate = cur ? cur + ' ' + word : word;
+      if (candidate.length <= maxChars) { cur = candidate; }
+      else { if (cur) lines.push(cur); cur = word.slice(0, maxChars); }
+    }
+    if (cur) lines.push(cur);
+    return lines.length > 0 ? lines : [text.slice(0, maxChars)];
+  };
+
+  // Font setup: on Windows, C:/Windows/Fonts paths contain C: which FFmpeg can't parse in filter
+  // option values (colon is always an option separator). Fix: copy fonts to a relative path with
+  // no colon. The relative path resolves against process.cwd() which FFmpeg also inherits as CWD.
+  let fontBold = null, fontReg = null;
+  if (process.platform === 'win32') {
+    try {
+      mkdirSync('temp-fonts', { recursive: true });
+      if (existsSync('C:/Windows/Fonts/arialbd.ttf')) {
+        if (!existsSync('temp-fonts/arialbd.ttf')) copyFileSync('C:/Windows/Fonts/arialbd.ttf', 'temp-fonts/arialbd.ttf');
+        fontBold = 'temp-fonts/arialbd.ttf';
+      }
+      if (existsSync('C:/Windows/Fonts/arial.ttf')) {
+        if (!existsSync('temp-fonts/arial.ttf')) copyFileSync('C:/Windows/Fonts/arial.ttf', 'temp-fonts/arial.ttf');
+        fontReg = 'temp-fonts/arial.ttf';
+      }
+    } catch (e) { console.warn('[lower-thirds] Font setup failed:', e.message); }
+  } else {
+    if (existsSync('/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf'))
+      fontBold = '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf';
+    if (existsSync('/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf'))
+      fontReg = '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf';
+  }
+
+  const vw = cropW || 270;
+  const textMaxW = vw - 20;                                      // 10px left + 10px right margin
+  const fs0 = Math.min(22, Math.max(14, Math.round(vw / 18)));   // title font size (bold)
+  const fs1 = Math.min(19, Math.max(13, Math.round(vw / 20)));   // subtitle font size (bold, ~20% larger than before)
+  const lh0 = fs0 + 6;   // line height for title
+  const lh1 = fs1 + 5;   // line height for subtitle
+  const vPad = 6;         // vertical padding top + bottom inside banner
+
+  let filter = '';
+
+  for (const seg of segments) {
+    if (!seg.lines || seg.lines.length === 0) continue;
+
+    const raw0 = normalize(seg.lines[0]);
+    const raw1 = seg.lines[1] ? normalize(seg.lines[1]) : null;
+    if (!raw0) continue;
+
+    // Wrap on normalized text (apostrophes intact for correct word boundaries),
+    // then apply FFmpeg escaping to each sub-line for safe embedding in text='...'.
+    const sl0 = wrapText(raw0, fs0, textMaxW).map(ffEscape);
+    const sl1 = raw1 ? wrapText(raw1, fs1, textMaxW).map(ffEscape) : [];
+
+    // Banner height: top-pad + title lines + subtitle lines + bottom-pad
+    const bannerH = vPad + sl0.length * lh0 + sl1.length * lh1 + vPad;
+
+    // \, written to file = literal \, bytes → FFmpeg filter parser reads as escaped comma
+    const enable = `enable=between(t\\,${seg.startTime.toFixed(2)}\\,${seg.endTime.toFixed(2)})`;
+
+    // Background box (drawbox uses ih/iw; drawtext uses h/w for frame dimensions)
+    filter += `,drawbox=x=0:y=ih-${bannerH}:w=iw:h=${bannerH}:color=${seg.bgcolor}@0.92:t=fill:${enable}`;
+
+    // Draw each line from top of banner downward; y=h-dist places text at dist px from bottom.
+    let yFromBannerTop = vPad;
+    for (const line of sl0) {
+      const dist = bannerH - yFromBannerTop;
+      const ff = fontBold ? `fontfile=${fontBold}:` : '';
+      filter += `,drawtext=${ff}fontsize=${fs0}:fontcolor=${seg.textcolor}:text='${line}':x=10:y=h-${dist}:shadowcolor=black@0.5:shadowx=1:shadowy=1:${enable}`;
+      yFromBannerTop += lh0;
+    }
+    for (const line of sl1) {
+      const dist = bannerH - yFromBannerTop;
+      const ff = fontBold ? `fontfile=${fontBold}:` : '';
+      filter += `,drawtext=${ff}fontsize=${fs1}:fontcolor=${seg.textcolor}@0.9:text='${line}':x=10:y=h-${dist}:shadowcolor=black@0.4:shadowx=1:shadowy=1:${enable}`;
+      yFromBannerTop += lh1;
+    }
+  }
+  return filter;
+}
+
+// Face-tracking smart crop
+async function handleFaceCrop(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  try {
+    const body = await parseBody(req);
+    const { assetId, aspectRatio, overrideBannerSegments } = body;
+
+    if (!assetId || !aspectRatio) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'assetId and aspectRatio are required' }));
+      return;
+    }
+
+    if (!['9:16', '1:1', '16:9'].includes(aspectRatio)) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'aspectRatio must be 9:16, 1:1, or 16:9' }));
+      return;
+    }
+
+    const asset = session.assets.get(assetId);
+    if (!asset) {
+      res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'Asset not found' }));
+      return;
+    }
+
+    if (!existsSync(asset.path)) {
+      res.writeHead(410, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({
+        error: 'Asset file no longer exists. The session may have expired. Please re-upload your video.',
+        code: 'ASSET_FILE_MISSING'
+      }));
+      return;
+    }
+
+    const jobId = randomUUID();
+    const newAssetId = randomUUID();
+    const outputPath = join(session.assetsDir, `${newAssetId}.mp4`);
+    const thumbPath = join(session.assetsDir, `${newAssetId}_thumb.jpg`);
+
+    console.log(`\n[${jobId}] === FACE CROP ===`);
+    console.log(`[${jobId}] Source: ${asset.filename}`);
+    console.log(`[${jobId}] Aspect ratio: ${aspectRatio}`);
+
+    // Run face detection in parallel with banner detection (or use provided override segments).
+    const scriptPath = join(process.cwd(), 'scripts', 'face-crop.py');
+    const [detectResult, bannerSegments] = await Promise.all([
+    new Promise((resolve, reject) => {
+      const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+      const py = spawn(pythonCmd, [`"${scriptPath}"`, `"${asset.path}"`, aspectRatio, `"${outputPath}"`], { shell: true });
+      let stdout = '';
+      let stderr = '';
+
+      py.stdout.on('data', (data) => { stdout += data.toString(); });
+      py.stderr.on('data', (data) => {
+        stderr += data.toString();
+        data.toString().split('\n').filter(l => l.trim()).forEach(line => {
+          console.log(`[${jobId}] FaceCrop: ${line}`);
+        });
+      });
+
+      py.on('close', (code) => {
+        if (code !== 0) {
+          try {
+            const result = JSON.parse(stdout);
+            if (result.error) { reject(new Error(result.error)); return; }
+          } catch (e) { /* fall through */ }
+          reject(new Error(`face-crop.py failed (exit ${code}): ${stderr.slice(-500)}`));
+          return;
+        }
+        try {
+          const result = JSON.parse(stdout);
+          if (result.error) { reject(new Error(result.error)); }
+          else { resolve(result); }
+        } catch (e) {
+          reject(new Error(`Failed to parse face-crop output: ${stdout.slice(0, 200)}`));
+        }
+      });
+
+      py.on('error', (err) => {
+        if (err.code === 'ENOENT') {
+          reject(new Error('Python not found. MediaPipe requires Python 3. Run: pip install mediapipe opencv-python'));
+        } else {
+          reject(err);
+        }
+      });
+    }),
+    // If caller supplies overrideBannerSegments, skip Gemini detection entirely (re-crop after false-positive removal).
+    Array.isArray(overrideBannerSegments)
+      ? Promise.resolve(overrideBannerSegments)
+      : detectAllLowerThirdBanners(asset.path, asset.duration || 0, jobId),
+    ]);
+
+    const { cropW, cropH, facesDetected, x: staticX, y: staticY, keyframes } = detectResult;
+    console.log(`[${jobId}] Detection: crop ${cropW}x${cropH} at (${staticX},${staticY}), faces=${facesDetected}`);
+
+    // Build FFmpeg crop command — dynamic via sendcmd file if keyframes available, static otherwise.
+    // sendcmd uses a relative filename (no drive letter colon) to avoid Windows filtergraph parsing issues.
+    // The nested if(lt(t,...)) expression approach was abandoned because FFmpeg has a ~99-level nesting limit.
+    let cropFilter;
+    let sendcmdFilePath = null;
+
+    if (keyframes && keyframes.length > 1) {
+      // Write keyframe commands to a temp file in CWD (relative path avoids Windows C: parsing issue).
+      // Format: "t crop x VALUE;" per line. FFmpeg inherits server CWD, so relative path resolves correctly.
+      const sendcmdFilename = `face-crop-${jobId}.txt`;
+      sendcmdFilePath = join(process.cwd(), sendcmdFilename);
+      // Linearly interpolate between 1fps keyframes at 30fps so the crop moves
+      // smoothly every frame instead of jumping once per second.
+      const interpFps = 30;
+      const sendcmdLines = [];
+      for (let i = 0; i < keyframes.length - 1; i++) {
+        const kf0 = keyframes[i];
+        const kf1 = keyframes[i + 1];
+        const steps = Math.round((kf1.t - kf0.t) * interpFps);
+        for (let s = 0; s < steps; s++) {
+          const alpha = s / steps;
+          const t = kf0.t + alpha * (kf1.t - kf0.t);
+          const x = Math.round(kf0.x + alpha * (kf1.x - kf0.x));
+          const y = Math.round(kf0.y + alpha * (kf1.y - kf0.y));
+          sendcmdLines.push(`${t.toFixed(4)} crop x ${x};`);
+          if (y !== kf0.y || y !== 0) sendcmdLines.push(`${t.toFixed(4)} crop y ${y};`);
+        }
+      }
+      // Add final keyframe
+      const lastKf = keyframes[keyframes.length - 1];
+      sendcmdLines.push(`${lastKf.t} crop x ${lastKf.x};`);
+      writeFileSync(sendcmdFilePath, sendcmdLines.join('\n'), 'utf-8');
+      cropFilter = `sendcmd=f=${sendcmdFilename},crop=${cropW}:${cropH}:${keyframes[0].x}:${keyframes[0].y}`;
+      console.log(`[${jobId}] Dynamic crop: ${keyframes.length} keyframes → ${sendcmdLines.length} interpolated commands at ${interpFps}fps`);
+    } else {
+      cropFilter = `crop=${cropW}:${cropH}:${staticX}:${staticY}`;
+    }
+
+    // Banner overlays are now created as separate V2 timeline clips on the frontend.
+    // Only apply the crop filter — no banner baking into the video.
+    console.log(`[${jobId}] FFmpeg filter: ${cropFilter}`);
+    let filterScriptPath = null;
+    const filterArgs = ['-vf', cropFilter];
+
+    const ffmpegArgs = [
+      '-y', '-i', asset.path,
+      ...filterArgs,
+      '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+      '-c:a', 'copy',
+      outputPath
+    ];
+
+    try {
+      await runFFmpeg(ffmpegArgs, jobId);
+    } finally {
+      if (sendcmdFilePath && existsSync(sendcmdFilePath)) {
+        try { unlinkSync(sendcmdFilePath); } catch (e) {}
+      }
+      if (filterScriptPath && existsSync(filterScriptPath)) {
+        try { unlinkSync(filterScriptPath); } catch (e) {}
+      }
+    }
+
+
+    // Generate thumbnail
+    await runFFmpeg([
+      '-y', '-i', outputPath,
+      '-vf', 'scale=160:90:force_original_aspect_ratio=decrease,pad=160:90:(ow-iw)/2:(oh-ih)/2',
+      '-frames:v', '1',
+      thumbPath
+    ], jobId);
+
+    // Get output file stats
+    const { stat } = await import('fs/promises');
+    const stats = await stat(outputPath);
+
+    // Get duration with ffprobe
+    let duration = asset.duration;
+    try {
+      const durationStr = execSync(
+        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${outputPath}"`,
+        { encoding: 'utf-8' }
+      ).trim();
+      duration = parseFloat(durationStr) || asset.duration;
+    } catch (e) {
+      console.warn(`[${jobId}] Could not get duration:`, e.message);
+    }
+
+    // Register new asset
+    const newAsset = {
+      id: newAssetId,
+      type: 'video',
+      filename: `face-crop-${asset.filename}`,
+      path: outputPath,
+      thumbPath: existsSync(thumbPath) ? thumbPath : null,
+      duration,
+      size: stats.size,
+      width: cropW,
+      height: cropH,
+      createdAt: Date.now(),
+      sourceAssetId: assetId,
+      cropAspectRatio: aspectRatio,
+      bannerSegments,
+    };
+    saveAssetMetadata(session);
+
+    session.assets.set(newAssetId, newAsset);
+
+    console.log(`[${jobId}] Face crop complete: ${newAssetId} (${cropW}x${cropH}, ${facesDetected} face(s))`);
+    console.log(`[${jobId}] === FACE CROP COMPLETE ===\n`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      success: true,
+      assetId: newAssetId,
+      filename: newAsset.filename,
+      duration,
+      thumbnailUrl: `/session/${sessionId}/assets/${newAssetId}/thumbnail`,
+      streamUrl: `/session/${sessionId}/assets/${newAssetId}/stream`,
+      cropW,
+      cropH,
+      facesDetected,
+      bannerDetected: bannerSegments.length > 0,
+      bannerSegments: bannerSegments.map(({ lines, bgcolor, textcolor, startTime, endTime }) => ({ lines, bgcolor, textcolor, startTime, endTime })),
+    }));
+
+  } catch (error) {
+    console.error('Face crop error:', error);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
 // ============== SERVER ==============
 
 const server = http.createServer(async (req, res) => {
@@ -7693,6 +8692,12 @@ const server = http.createServer(async (req, res) => {
     } else if (req.method === 'PUT' && action === 'project') {
       await handleProjectSave(req, res, sessionId);
     }
+    // Progress polling
+    else if (req.method === 'GET' && action === 'progress') {
+      const prog = operationProgress.get(sessionId) || { progress: 0, operation: '', status: 'idle' };
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify(prog));
+    }
     // Render endpoints
     else if (req.method === 'POST' && action === 'render') {
       await handleProjectRender(req, res, sessionId);
@@ -7753,6 +8758,10 @@ const server = http.createServer(async (req, res) => {
     else if (req.method === 'POST' && action === 'process-asset') {
       await handleProcessAsset(req, res, sessionId);
     }
+    // Face-tracking smart crop
+    else if (req.method === 'POST' && action === 'face-crop') {
+      await handleFaceCrop(req, res, sessionId);
+    }
     // Extract audio from video (creates audio asset + muted video)
     else if (req.method === 'POST' && action === 'extract-audio') {
       await handleExtractAudio(req, res, sessionId);
@@ -7810,6 +8819,71 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ error: 'Not found' }));
   }
 });
+
+// Pre-download all fonts needed for export (banner drawtext + caption ASS rendering).
+// Runs non-blocking at startup so renders that happen after the download completes get the
+// correct fonts; earlier renders fall back to Arial if needed.
+async function ensureExportFonts() {
+  const FONTS_DIR = 'temp-fonts';
+  try { mkdirSync(FONTS_DIR, { recursive: true }); } catch (_) {}
+
+  const needed = [
+    // Banner / UI font (Inter) — matches font-family: Inter in index.css
+    { file: 'inter-400.ttf', family: 'Inter', weight: 400 },
+    { file: 'inter-600.ttf', family: 'Inter', weight: 600 },
+    { file: 'inter-700.ttf', family: 'Inter', weight: 700 },
+    { file: 'inter-900.ttf', family: 'Inter', weight: 900 },
+    // Caption fonts listed in CaptionPropertiesPanel FONT_OPTIONS
+    { file: 'roboto-400.ttf',      family: 'Roboto',      weight: 400 },
+    { file: 'roboto-700.ttf',      family: 'Roboto',      weight: 700 },
+    { file: 'roboto-900.ttf',      family: 'Roboto',      weight: 900 },
+    { file: 'poppins-400.ttf',     family: 'Poppins',     weight: 400 },
+    { file: 'poppins-700.ttf',     family: 'Poppins',     weight: 700 },
+    { file: 'poppins-900.ttf',     family: 'Poppins',     weight: 900 },
+    { file: 'montserrat-400.ttf',  family: 'Montserrat',  weight: 400 },
+    { file: 'montserrat-700.ttf',  family: 'Montserrat',  weight: 700 },
+    { file: 'montserrat-900.ttf',  family: 'Montserrat',  weight: 900 },
+    { file: 'oswald-400.ttf',      family: 'Oswald',      weight: 400 },
+    { file: 'oswald-700.ttf',      family: 'Oswald',      weight: 700 },
+    { file: 'bebas-neue-400.ttf',  family: 'Bebas Neue',  weight: 400 },
+  ];
+
+  const missing = needed.filter(f => !existsSync(`${FONTS_DIR}/${f.file}`));
+  if (missing.length === 0) return;
+
+  console.log(`[fonts] Downloading ${missing.length} missing font file(s)…`);
+  const { default: https } = await import('https');
+
+  const downloadTTF = (family, weight, dest) => new Promise((resolve) => {
+    const url = `https://fonts.googleapis.com/css2?family=${encodeURIComponent(family)}:wght@${weight}`;
+    https.get(url, (res) => {
+      let css = '';
+      res.on('data', d => css += d);
+      res.on('end', () => {
+        const match = css.match(/https:\/\/[^)]+\.ttf/);
+        if (!match) { console.warn(`[fonts] No TTF URL for ${family}:${weight}`); return resolve(); }
+        const ttfUrl = match[0];
+        https.get(ttfUrl, (r) => {
+          const chunks = [];
+          r.on('data', d => chunks.push(d));
+          r.on('end', () => {
+            writeFileSync(dest, Buffer.concat(chunks));
+            console.log(`[fonts] ✓ ${dest}`);
+            resolve();
+          });
+          r.on('error', (e) => { console.warn(`[fonts] ✗ ${dest}: ${e.message}`); resolve(); });
+        });
+      });
+      res.on('error', (e) => { console.warn(`[fonts] ✗ CSS for ${family}:${weight}: ${e.message}`); resolve(); });
+    });
+  });
+
+  for (const { file, family, weight } of missing) {
+    await downloadTTF(family, weight, `${FONTS_DIR}/${file}`);
+  }
+}
+
+ensureExportFonts().catch(e => console.warn('[fonts] Font setup error:', e.message));
 
 server.listen(PORT, () => {
   console.log(`\n🎬 Local FFmpeg server running at http://localhost:${PORT}`);

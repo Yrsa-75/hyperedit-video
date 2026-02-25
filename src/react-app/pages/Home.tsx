@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import VideoPreview, { VideoPreviewHandle } from '@/react-app/components/VideoPreview';
 import Timeline from '@/react-app/components/Timeline';
 import AssetLibrary from '@/react-app/components/AssetLibrary';
@@ -13,7 +14,7 @@ import ResizableVerticalPanel from '@/react-app/components/ResizableVerticalPane
 import TimelineTabs from '@/react-app/components/TimelineTabs';
 import { useProject, Asset, TimelineClip, CaptionStyle } from '@/react-app/hooks/useProject';
 import { useVideoSession } from '@/react-app/hooks/useVideoSession';
-import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Palette, Film } from 'lucide-react';
+import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Palette, Film, ChevronDown, ZoomIn, ZoomOut, Save, Undo2, Redo2, Loader2 } from 'lucide-react';
 import type { TemplateId } from '@/remotion/templates';
 
 interface ChapterData {
@@ -35,6 +36,9 @@ export default function Home() {
   const [autoSnap, setAutoSnap] = useState(true); // Ripple delete mode - shift clips when deleting
   const [activeAgent, setActiveAgent] = useState<'director' | 'picasso' | 'dicaprio'>('director');
   const [showGifSearch, setShowGifSearch] = useState(false);
+  const [previewZoom, setPreviewZoom] = useState(1);
+  const [savedFeedback, setSavedFeedback] = useState(false);
+  const [actionStatus, setActionStatus] = useState('');
 
   const videoPreviewRef = useRef<VideoPreviewHandle>(null);
   const playbackRef = useRef<number | null>(null);
@@ -48,6 +52,7 @@ export default function Home() {
     clips,
     loading,
     status,
+    renderProgress,
     checkServer,
     uploadAsset,
     deleteAsset,
@@ -65,6 +70,7 @@ export default function Home() {
     // Captions
     addCaptionClipsBatch,
     updateCaptionStyle,
+    updateCaptionWords,
     getCaptionData,
     // Timeline tabs
     timelineTabs,
@@ -76,6 +82,15 @@ export default function Home() {
     updateTabAsset,
     // Settings
     setSettings,
+    // Project name
+    projectFilename,
+    setProjectFilename,
+    // Undo / Redo
+    undo,
+    redo,
+    canUndo,
+    canRedo,
+    pushHistory,
   } = useProject();
 
   // Compute the active clips based on which tab is selected
@@ -99,6 +114,17 @@ export default function Home() {
   useEffect(() => {
     checkServer();
   }, [checkServer]);
+
+  // Global keyboard shortcuts: Ctrl+Z = undo, Ctrl+Y / Ctrl+Shift+Z = redo
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const ctrl = e.ctrlKey || e.metaKey;
+      if (ctrl && !e.shiftKey && e.key === 'z') { e.preventDefault(); undo(); }
+      if (ctrl && (e.key === 'y' || (e.shiftKey && e.key === 'z'))) { e.preventDefault(); redo(); }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [undo, redo]);
 
   // Load project from server when session becomes available
   useEffect(() => {
@@ -132,13 +158,14 @@ export default function Home() {
     const layers: Array<{
       id: string;
       url: string;
-      type: 'video' | 'image' | 'audio' | 'caption';
+      type: 'video' | 'image' | 'audio' | 'caption' | 'lower-third';
       trackId: string;
       clipTime: number;
       clipStart: number;
       transform?: TimelineClip['transform'];
       captionWords?: Array<{ text: string; start: number; end: number }>;
       captionStyle?: CaptionStyle;
+      bannerData?: { lines: string[]; bgcolor: string; textcolor: string; cropAspectRatio: string };
     }> = [];
 
     // Check video tracks (V1, V2, V3...)
@@ -152,6 +179,19 @@ export default function Home() {
       );
 
       for (const clip of clipsOnTrack) {
+        // Banner clips have no asset — render as lower-third HTML overlay
+        if (clip.bannerData) {
+          layers.push({
+            id: clip.id,
+            url: '',
+            type: 'lower-third',
+            trackId: clip.trackId,
+            clipTime: currentTime - clip.start,
+            clipStart: clip.start,
+            bannerData: clip.bannerData,
+          });
+          continue;
+        }
         const asset = assets.find(a => a.id === clip.assetId);
         // Use asset.streamUrl which has cache-busting timestamp from refreshAssets
         const url = asset?.streamUrl || (asset ? getAssetStreamUrl(asset.id) : null);
@@ -500,6 +540,20 @@ export default function Home() {
     saveProject();
   }, [updateClip, saveProject]);
 
+  // Handle updating lower-third banner data (text lines, colors)
+  const handleUpdateBannerData = useCallback((clipId: string, bannerData: TimelineClip['bannerData']) => {
+    pushHistory();
+    updateClip(clipId, { bannerData });
+    saveProject();
+  }, [pushHistory, updateClip, saveProject]);
+
+  // Handle updating lower-third clip duration
+  const handleUpdateBannerDuration = useCallback((clipId: string, duration: number) => {
+    pushHistory();
+    updateClip(clipId, { duration });
+    saveProject();
+  }, [pushHistory, updateClip, saveProject]);
+
   // Get selected clip and its asset
   const selectedClip = useMemo(() =>
     clips.find(c => c.id === selectedClipId) || null,
@@ -561,6 +615,8 @@ export default function Home() {
       targetAssetId = videoAsset.id;
     }
 
+    setActionStatus('Applying AI edit…');
+    try {
     console.log('Applying FFmpeg edit to asset:', targetAssetId);
     console.log('Command:', command);
 
@@ -594,6 +650,9 @@ export default function Home() {
       }
       await saveProject();
     }
+    } finally {
+      setActionStatus('');
+    }
   }, [session, assets, clips, selectedClipId, refreshAssets, updateClip, saveProject]);
 
   // Handle chapter generation
@@ -603,6 +662,7 @@ export default function Home() {
       return;
     }
 
+    setActionStatus('Generating chapters…');
     try {
       const result = await legacyGenerateChapters();
       setChapterData(result);
@@ -610,6 +670,8 @@ export default function Home() {
     } catch (error) {
       console.error('Chapter generation failed:', error);
       alert(`Failed to generate chapters: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } finally {
+      setActionStatus('');
     }
   }, [legacySession, legacyGenerateChapters]);
 
@@ -638,6 +700,8 @@ export default function Home() {
       throw new Error('No video clip on V1 track. Please add a video to the timeline first.');
     }
 
+    setActionStatus('Cutting at chapter marks…');
+    try {
     console.log('Generating chapters and making cuts...');
 
     // Generate chapters using the session API
@@ -740,6 +804,9 @@ export default function Home() {
       cutsApplied,
       youtubeFormat: result.youtubeFormat || '',
     };
+    } finally {
+      setActionStatus('');
+    }
   }, [session, clips, loadProject]);
 
   // Handle auto-extract keywords and add GIFs
@@ -754,6 +821,8 @@ export default function Home() {
       throw new Error('Please upload a video first');
     }
 
+    setActionStatus('Extracting keywords & GIFs…');
+    try {
     // Call the transcribe-and-extract endpoint
     const response = await fetch(`http://localhost:3333/session/${session.sessionId}/transcribe-and-extract`, {
       method: 'POST',
@@ -778,6 +847,9 @@ export default function Home() {
     await saveProject();
 
     return data;
+    } finally {
+      setActionStatus('');
+    }
   }, [session, assets, addClip, saveProject]);
 
   // Handle generating B-roll images and adding to timeline
@@ -792,6 +864,8 @@ export default function Home() {
       throw new Error('Please upload a video first');
     }
 
+    setActionStatus('Generating B-roll images…');
+    try {
     // Call the generate-broll endpoint
     const response = await fetch(`http://localhost:3333/session/${session.sessionId}/generate-broll`, {
       method: 'POST',
@@ -863,6 +937,9 @@ export default function Home() {
     console.log('B-roll clips added successfully!');
 
     return data;
+    } finally {
+      setActionStatus('');
+    }
   }, [session, assets, refreshAssets, loadProject]);
 
   // Handle removing dead air / silence from the video
@@ -877,6 +954,8 @@ export default function Home() {
       throw new Error('Please upload a video first');
     }
 
+    setActionStatus('Removing silence…');
+    try {
     console.log('Removing dead air from video...');
 
     // Call the remove-dead-air endpoint
@@ -928,10 +1007,79 @@ export default function Home() {
       duration: result.duration,
       removedDuration: result.removedDuration,
     };
+    } finally {
+      setActionStatus('');
+    }
   }, [session, assets, clips, refreshAssets, updateClip, saveProject]);
 
+  // Handle face-tracking smart crop
+  const handleFaceCrop = useCallback(async (assetId: string, aspectRatio: string): Promise<{ assetId: string; facesDetected: number; bannerDetected: boolean; bannerCount: number }> => {
+    if (!session) {
+      throw new Error('No session available');
+    }
+
+    setActionStatus('Running smart crop…');
+    try {
+    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/face-crop`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ assetId, aspectRatio }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Failed to apply smart crop');
+    }
+
+    const result = await response.json();
+
+    await refreshAssets();
+
+    // Update all clips using this assetId to point to the new cropped asset
+    clips.filter(c => c.assetId === assetId).forEach(c => {
+      updateClip(c.id, { assetId: result.assetId });
+    });
+
+    // Find the root source asset ID (walk up the crop chain)
+    const cropAsset = assets.find(a => a.id === assetId);
+    const rootSourceId = cropAsset?.sourceAssetId || assetId;
+
+    // Delete any existing banner clips from a previous crop of this source asset
+    clips.filter(c => c.bannerData?.sourceAssetId === rootSourceId).forEach(c => {
+      deleteClip(c.id);
+    });
+
+    // Create a V2 banner clip for each detected lower-third segment (actual detected duration)
+    const bannerSegments: Array<{ lines: string[]; bgcolor: string; textcolor: string; startTime: number; endTime: number }> = result.bannerSegments ?? [];
+    for (const seg of bannerSegments) {
+      const duration = Math.max(1, seg.endTime - seg.startTime);
+      const bannerClip = addClip('', 'V2', seg.startTime, duration);
+      updateClip(bannerClip.id, {
+        bannerData: {
+          lines: seg.lines,
+          bgcolor: seg.bgcolor || '#1a2a4a',
+          textcolor: seg.textcolor || '#ffffff',
+          sourceAssetId: rootSourceId,
+          cropAspectRatio: aspectRatio,
+        },
+      });
+    }
+
+    await saveProject();
+
+    return {
+      assetId: result.assetId,
+      facesDetected: result.facesDetected,
+      bannerDetected: (result.bannerSegments ?? []).length > 0,
+      bannerCount: (result.bannerSegments ?? []).length,
+    };
+    } finally {
+      setActionStatus('');
+    }
+  }, [session, assets, clips, refreshAssets, addClip, updateClip, deleteClip, saveProject]);
+
   // Handle transcribing video and adding captions
-  const handleTranscribeAndAddCaptions = useCallback(async (options?: { highlightColor?: string; fontFamily?: string }) => {
+  const handleTranscribeAndAddCaptions = useCallback(async (options?: { highlightColor?: string; fontFamily?: string; constrainTo916?: boolean }) => {
     if (!session) {
       throw new Error('No session available');
     }
@@ -943,6 +1091,8 @@ export default function Home() {
       throw new Error('Please upload a video first');
     }
 
+    setActionStatus('Transcribing audio…');
+    try {
     // Call the transcribe endpoint
     const response = await fetch(`http://localhost:3333/session/${session.sessionId}/transcribe`, {
       method: 'POST',
@@ -957,6 +1107,7 @@ export default function Home() {
 
     const data = await response.json();
     console.log('Transcription result:', data);
+    setActionStatus('Adding captions…');
 
     if (data.words && data.words.length > 0) {
       // Split words into chunks based on natural speech pauses
@@ -1015,6 +1166,7 @@ export default function Home() {
           style: {
             ...(options?.highlightColor && { highlightColor: options.highlightColor }),
             ...(options?.fontFamily && { fontFamily: options.fontFamily }),
+            ...(options?.constrainTo916 && { constrainTo916: true }),
           },
         };
       });
@@ -1027,6 +1179,9 @@ export default function Home() {
     }
 
     return data;
+    } finally {
+      setActionStatus('');
+    }
   }, [session, assets, addCaptionClipsBatch, saveProject]);
 
   // Handle updating caption style
@@ -1034,6 +1189,12 @@ export default function Home() {
     updateCaptionStyle(clipId, styleUpdates);
     saveProject();
   }, [updateCaptionStyle, saveProject]);
+
+  // Handle updating caption text
+  const handleUpdateCaptionWords = useCallback((clipId: string, newText: string) => {
+    updateCaptionWords(clipId, newText);
+    saveProject();
+  }, [updateCaptionWords, saveProject]);
 
   // Wrapper for AI prompt panel motion graphics (takes config object)
   const handleAddMotionGraphicFromPrompt = useCallback(async (config: {
@@ -1050,6 +1211,7 @@ export default function Home() {
       return;
     }
 
+    setActionStatus('Rendering motion graphic…');
     try {
       // Call the server to render the motion graphic
       const response = await fetch(`http://localhost:3333/session/${session.sessionId}/render-motion-graphic`, {
@@ -1087,6 +1249,8 @@ export default function Home() {
     } catch (error) {
       console.error('Failed to add motion graphic:', error);
       throw error; // Re-throw so AIPromptPanel can show error
+    } finally {
+      setActionStatus('');
     }
   }, [session, currentTime, addClip, saveProject, refreshAssets, switchTimelineTab]);
 
@@ -1096,6 +1260,7 @@ export default function Home() {
       throw new Error('Please upload a video first to start a session');
     }
 
+    setActionStatus('Generating AI animation…');
     try {
       // Find the primary video asset to use as context for the animation
       // First check V1 clips, then fall back to first video asset
@@ -1189,6 +1354,8 @@ export default function Home() {
     } catch (error) {
       console.error('Failed to create custom animation:', error);
       throw error;
+    } finally {
+      setActionStatus('');
     }
   }, [session, currentTime, addClip, saveProject, refreshAssets, getDuration, switchTimelineTab, clips, assets]);
 
@@ -1207,6 +1374,8 @@ export default function Home() {
       throw new Error('Please upload a video first');
     }
 
+    setActionStatus('Analyzing video…');
+    try {
     // Debug: log the time range being sent to server
     console.log('[DEBUG] Sending analyze-for-animation with timeRange:', JSON.stringify(request.timeRange));
 
@@ -1229,6 +1398,9 @@ export default function Home() {
     }
 
     return await response.json();
+    } finally {
+      setActionStatus('');
+    }
   }, [session, assets]);
 
   // Handle rendering from pre-approved concept (skips analysis, uses provided scenes)
@@ -1250,6 +1422,8 @@ export default function Home() {
       throw new Error('Please upload a video first to start a session');
     }
 
+    setActionStatus('Rendering animation…');
+    try {
     const response = await fetch(`http://localhost:3333/session/${session.sessionId}/render-from-concept`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1305,6 +1479,9 @@ export default function Home() {
       assetId: data.assetId,
       duration: data.duration,
     };
+    } finally {
+      setActionStatus('');
+    }
   }, [session, currentTime, refreshAssets, addClip, saveProject, getDuration, switchTimelineTab]);
 
   // Handle generating transcript animation (kinetic typography from speech)
@@ -1313,6 +1490,8 @@ export default function Home() {
       throw new Error('Please upload a video first to start a session');
     }
 
+    setActionStatus('Generating kinetic text…');
+    try {
     const response = await fetch(`http://localhost:3333/session/${session.sessionId}/generate-transcript-animation`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1344,6 +1523,9 @@ export default function Home() {
       assetId: data.assetId,
       duration: data.duration,
     };
+    } finally {
+      setActionStatus('');
+    }
   }, [session, currentTime, refreshAssets, addClip, saveProject]);
 
   // Handle batch animation generation (multiple animations across the video)
@@ -1455,6 +1637,7 @@ export default function Home() {
       throw new Error('Please upload a video first');
     }
 
+    setActionStatus('Generating contextual animation…');
     try {
       // Call the server to generate contextual animation
       // This endpoint will:
@@ -1502,22 +1685,47 @@ export default function Home() {
     } catch (error) {
       console.error('Failed to create contextual animation:', error);
       throw error;
+    } finally {
+      setActionStatus('');
     }
   }, [session, assets, addClip, saveProject, getDuration, refreshAssets]);
 
+  // Export submenu state
+  const [showExportMenu, setShowExportMenu] = useState(false);
+  const exportMenuRef = useRef<HTMLDivElement>(null);
+  const exportDropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!showExportMenu) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      const inButton = exportMenuRef.current?.contains(e.target as Node);
+      const inDropdown = exportDropdownRef.current?.contains(e.target as Node);
+      if (!inButton && !inDropdown) {
+        setShowExportMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [showExportMenu]);
+
   // Handle render/export
-  const handleExport = useCallback(async () => {
+  const handleExport = useCallback(async (width: number, height: number) => {
     if (clips.length === 0) {
       alert('Add some clips to the timeline first');
       return;
     }
 
+    const gcd = (a: number, b: number): number => b === 0 ? a : gcd(b, a % b);
+    const g = gcd(width, height);
+    const formatLabel = `export_${width / g}:${height / g}`;
+    const baseName = (projectFilename || 'export').replace(/\s+/g, '_');
+
     try {
-      const downloadUrl = await renderProject(false);
+      const downloadUrl = await renderProject(false, width, height);
       // Trigger download
       const link = document.createElement('a');
       link.href = downloadUrl;
-      link.download = 'export.mp4';
+      link.download = `${baseName}_${formatLabel}.mp4`;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
@@ -1525,7 +1733,7 @@ export default function Home() {
       console.error('Export failed:', error);
       alert(`Export failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
-  }, [clips.length, renderProject]);
+  }, [clips.length, renderProject, projectFilename]);
 
   // Edit an existing animation with a new prompt
   const handleEditAnimation = useCallback(async (
@@ -1538,6 +1746,8 @@ export default function Home() {
       throw new Error('No active session');
     }
 
+    setActionStatus('Editing animation…');
+    try {
     // Get available assets to pass to the AI
     const availableAssets = assets
       .filter(a => a.type === 'image' || a.type === 'video')
@@ -1606,6 +1816,9 @@ export default function Home() {
       sceneCount: data.sceneCount,
       editCount: data.editCount,
     };
+    } finally {
+      setActionStatus('');
+    }
   }, [session, assets, refreshAssets, updateTabAsset]);
 
   // Open an animation in a new timeline tab for isolated editing
@@ -1636,21 +1849,79 @@ export default function Home() {
   return (
     <div className="flex flex-col h-screen bg-zinc-950 text-white overflow-hidden">
       {/* Header */}
-      <header className="flex items-center justify-between px-6 py-3 bg-zinc-900/50 border-b border-zinc-800/50 backdrop-blur-sm">
+      <header className="relative flex items-center justify-between px-6 py-3 bg-zinc-900/50 border-b border-zinc-800/50 backdrop-blur-sm">
+        {/* Centered undo / redo */}
+        <div className="absolute left-1/2 -translate-x-1/2 flex items-center gap-1">
+          <button
+            onClick={undo}
+            disabled={!canUndo}
+            title="Undo (Ctrl+Z)"
+            className="p-1.5 rounded-lg hover:bg-zinc-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors text-zinc-400 hover:text-white"
+          >
+            <Undo2 className="w-4 h-4" />
+          </button>
+          <button
+            onClick={redo}
+            disabled={!canRedo}
+            title="Redo (Ctrl+Y)"
+            className="p-1.5 rounded-lg hover:bg-zinc-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors text-zinc-400 hover:text-white"
+          >
+            <Redo2 className="w-4 h-4" />
+          </button>
+        </div>
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2">
-            <div className="w-8 h-8 bg-gradient-to-br from-orange-500 to-amber-500 rounded-lg flex items-center justify-center">
-              <Sparkles className="w-5 h-5" />
-            </div>
+            <img src="/YRSAstudio.png" alt="YRSAstudio" className="w-8 h-8 rounded-lg object-contain" />
             <h1 className="text-xl font-bold bg-gradient-to-r from-orange-400 to-amber-400 bg-clip-text text-transparent">
-              HyperEdit
+              YRSAstudio
             </h1>
           </div>
-          {currentStatus && (
-            <span className="text-xs text-zinc-400 bg-zinc-800 px-2 py-1 rounded">
-              {currentStatus}
-            </span>
-          )}
+          <div className="flex items-center gap-1">
+            <input
+              type="text"
+              value={projectFilename}
+              onChange={e => setProjectFilename(e.target.value)}
+              className="w-[180px] px-3 py-1.5 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-white placeholder-zinc-500 focus:outline-none focus:border-orange-500 transition-colors"
+              placeholder="Project name"
+            />
+            <button
+              onClick={async () => {
+                await saveProject();
+                setSavedFeedback(true);
+                setTimeout(() => setSavedFeedback(false), 1500);
+              }}
+              title="Save project"
+              className="p-1.5 rounded-lg hover:bg-zinc-700 transition-colors text-zinc-400 hover:text-white"
+            >
+              {savedFeedback
+                ? <Check className="w-4 h-4 text-green-400" />
+                : <Save className="w-4 h-4" />}
+            </button>
+          </div>
+          {/* Status indicator — always visible */}
+          <div className="flex items-center gap-2 px-2.5 py-1.5 bg-zinc-800/80 rounded-lg min-w-[170px]">
+            {(actionStatus || isProcessing) ? (
+              <Loader2 className="w-3 h-3 animate-spin text-orange-400 flex-shrink-0" />
+            ) : (
+              <div className={`w-2 h-2 rounded-full flex-shrink-0 ${currentStatus ? 'bg-green-400' : 'bg-zinc-600'}`} />
+            )}
+            <div className="flex flex-col min-w-0 flex-1">
+              <span className={`text-xs truncate ${actionStatus || currentStatus || isProcessing ? 'text-zinc-300' : 'text-zinc-500'}`}>
+                {actionStatus || currentStatus || (isProcessing ? 'Processing…' : 'Inactive')}
+              </span>
+              {renderProgress !== null && (
+                <div className="flex items-center gap-1.5 mt-0.5">
+                  <div className="flex-1 h-1 bg-zinc-700 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-gradient-to-r from-orange-500 to-amber-400 transition-all duration-500"
+                      style={{ width: `${renderProgress}%` }}
+                    />
+                  </div>
+                  <span className="text-[10px] text-zinc-500 tabular-nums flex-shrink-0">{renderProgress}%</span>
+                </div>
+              )}
+            </div>
+          </div>
         </div>
         <div className="flex items-center gap-3">
           {(session || legacySession) && (
@@ -1664,20 +1935,47 @@ export default function Home() {
                 Chapters
               </button>
               {clips.length > 0 && (
-                <button
-                  onClick={handleExport}
-                  disabled={isProcessing}
-                  className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors flex items-center gap-2"
-                >
-                  <Download className="w-4 h-4" />
-                  Export
-                </button>
+                <div className="relative" ref={exportMenuRef}>
+                  <button
+                    onClick={() => setShowExportMenu(v => !v)}
+                    disabled={isProcessing}
+                    className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors flex items-center gap-2"
+                  >
+                    <Download className="w-4 h-4" />
+                    Export
+                    <ChevronDown className="w-4 h-4" />
+                  </button>
+                  {showExportMenu && exportMenuRef.current && createPortal(
+                    <div
+                      ref={exportDropdownRef}
+                      className="fixed bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl min-w-[150px] text-white"
+                      style={{
+                        zIndex: 99999,
+                        top: exportMenuRef.current.getBoundingClientRect().bottom + 4,
+                        right: window.innerWidth - exportMenuRef.current.getBoundingClientRect().right,
+                      }}
+                    >
+                      {([
+                        { label: 'Export 16:9', w: 1920, h: 1080 },
+                        { label: 'Export 1:1',  w: 1080, h: 1080 },
+                        { label: 'Export 9:16', w: 1080, h: 1920 },
+                      ] as const).map(({ label, w, h }) => (
+                        <button
+                          key={label}
+                          onClick={() => { setShowExportMenu(false); handleExport(w, h); }}
+                          className="block w-full text-left px-4 py-2 text-sm hover:bg-zinc-700 transition-colors"
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </div>,
+                    document.body
+                  )}
+                </div>
               )}
             </>
           )}
-          <button className="px-4 py-2 bg-gradient-to-r from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 rounded-lg text-sm font-medium transition-all">
-            AI Edit
-          </button>
+
         </div>
       </header>
 
@@ -1799,6 +2097,7 @@ export default function Home() {
                   <CaptionPropertiesPanel
                     captionData={selectedCaptionData}
                     onUpdateStyle={(styleUpdates) => handleUpdateCaptionStyle(selectedClipId, styleUpdates)}
+                    onUpdateWords={(newText) => handleUpdateCaptionWords(selectedClipId, newText)}
                     onClose={() => setSelectedClipId(null)}
                   />
                 ) : (
@@ -1807,6 +2106,9 @@ export default function Home() {
                     asset={selectedClipAsset}
                     onUpdateTransform={handleUpdateClipTransform}
                     onClose={() => setSelectedClipId(null)}
+                    onFaceCrop={handleFaceCrop}
+                    onUpdateBanner={handleUpdateBannerData}
+                    onUpdateDuration={handleUpdateBannerDuration}
                   />
                 )}
               </div>
@@ -1817,32 +2119,54 @@ export default function Home() {
         {/* Main Editor Area */}
         <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
           {/* Video Preview */}
-          <div className="flex-1 flex items-center justify-center bg-zinc-900/30 p-4 min-h-0 overflow-hidden">
-            {hasPreviewContent ? (
-              <VideoPreview
-                ref={videoPreviewRef}
-                layers={previewLayers}
-                isPlaying={isPlaying && !previewAssetId}
-                aspectRatio={aspectRatio}
-                onLayerMove={handleLayerMove}
-                onLayerSelect={handleLayerSelect}
-                selectedLayerId={selectedClipId}
-              />
-            ) : clips.length > 0 ? (
-              // Assets exist but playhead is not over any clip
-              <div className={`relative ${aspectRatio === '9:16' ? 'h-[65vh] w-auto aspect-[9/16]' : 'w-full max-w-4xl aspect-video'} bg-black rounded-xl overflow-hidden shadow-2xl ring-1 ring-white/10 flex items-center justify-center`}>
-                <div className="text-center text-zinc-600">
-                  <div className="text-sm">No clip at playhead</div>
-                  <div className="text-xs mt-1">Move playhead over a clip to preview</div>
+          <div className="flex-1 flex flex-col bg-zinc-900/30 min-h-0 overflow-hidden">
+            <div className="flex-1 flex items-center justify-center p-4 min-h-0 overflow-hidden">
+              {hasPreviewContent ? (
+                <div style={{ transform: `scale(${previewZoom})`, transformOrigin: 'center center', transition: 'transform 0.15s ease' }} className="w-full flex items-center justify-center">
+                  <VideoPreview
+                    ref={videoPreviewRef}
+                    layers={previewLayers}
+                    isPlaying={isPlaying && !previewAssetId}
+                    aspectRatio={aspectRatio}
+                    onLayerMove={handleLayerMove}
+                    onLayerSelect={handleLayerSelect}
+                    selectedLayerId={selectedClipId}
+                  />
                 </div>
-              </div>
-            ) : (
-              <div className="flex flex-col items-center justify-center text-zinc-500">
-                <Play className="w-16 h-16 mb-4 opacity-50" />
-                <p className="text-sm">Upload assets from the left panel</p>
-                <p className="text-xs text-zinc-600 mt-1">Drag them to the timeline below</p>
-              </div>
-            )}
+              ) : clips.length > 0 ? (
+                // Assets exist but playhead is not over any clip
+                <div className={`relative ${aspectRatio === '9:16' ? 'h-[65vh] w-auto aspect-[9/16]' : 'w-full max-w-4xl aspect-video'} bg-black rounded-xl overflow-hidden shadow-2xl ring-1 ring-white/10 flex items-center justify-center`}>
+                  <div className="text-center text-zinc-600">
+                    <div className="text-sm">No clip at playhead</div>
+                    <div className="text-xs mt-1">Move playhead over a clip to preview</div>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex flex-col items-center justify-center text-zinc-500">
+                  <Play className="w-16 h-16 mb-4 opacity-50" />
+                  <p className="text-sm">Upload assets from the left panel</p>
+                  <p className="text-xs text-zinc-600 mt-1">Drag them to the timeline below</p>
+                </div>
+              )}
+            </div>
+            {/* Preview zoom controls */}
+            <div className="flex items-center justify-end gap-1 px-3 py-1.5 border-t border-zinc-800/50">
+              <button
+                onClick={() => setPreviewZoom(z => Math.max(0.25, parseFloat((z - 0.25).toFixed(2))))}
+                className="p-1.5 bg-zinc-700 hover:bg-zinc-600 rounded text-xs transition-colors"
+                title="Zoom out"
+              >
+                <ZoomOut className="w-3.5 h-3.5" />
+              </button>
+              <span className="text-xs text-zinc-400 w-12 text-center">{Math.round(previewZoom * 100)}%</span>
+              <button
+                onClick={() => setPreviewZoom(z => Math.min(4, parseFloat((z + 0.25).toFixed(2))))}
+                className="p-1.5 bg-zinc-700 hover:bg-zinc-600 rounded text-xs transition-colors"
+                title="Zoom in"
+              >
+                <ZoomIn className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
 
           {/* Timeline - Resizable height */}
@@ -1935,6 +2259,7 @@ export default function Home() {
                   onTranscribeAndAddCaptions={handleTranscribeAndAddCaptions}
                   onGenerateBroll={handleGenerateBroll}
                   onRemoveDeadAir={handleRemoveDeadAir}
+                  onFaceCrop={handleFaceCrop}
                   onChapterCuts={handleChapterCuts}
                   onAddMotionGraphic={handleAddMotionGraphicFromPrompt}
                   onCreateCustomAnimation={handleCreateCustomAnimation}

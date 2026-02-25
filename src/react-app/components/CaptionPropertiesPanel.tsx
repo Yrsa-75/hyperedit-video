@@ -1,10 +1,11 @@
-import { useCallback } from 'react';
-import { Type, X, Palette, AlignCenter } from 'lucide-react';
+import { useCallback, useState, useEffect } from 'react';
+import { Type, X, Palette, AlignCenter, Check } from 'lucide-react';
 import type { CaptionStyle, CaptionData } from '@/react-app/hooks/useProject';
 
 interface CaptionPropertiesPanelProps {
   captionData: CaptionData;
   onUpdateStyle: (styleUpdates: Partial<CaptionStyle>) => void;
+  onUpdateWords: (newText: string) => void;
   onClose: () => void;
 }
 
@@ -36,49 +37,78 @@ const POSITION_OPTIONS = [
 export default function CaptionPropertiesPanel({
   captionData,
   onUpdateStyle,
+  onUpdateWords,
   onClose,
 }: CaptionPropertiesPanelProps) {
   const style = captionData.style;
 
-  const handleFontChange = useCallback((value: string) => {
-    onUpdateStyle({ fontFamily: value });
-  }, [onUpdateStyle]);
+  // Smart join: no space after apostrophe/hyphen endings or before apostrophe/punctuation starts
+  const joinWords = (words: CaptionData['words']) =>
+    words.reduce((acc, w, i) => {
+      if (i === 0) return w.text;
+      const prev = words[i - 1].text;
+      const needsSpace = !prev.endsWith("'") && !prev.endsWith("-")
+        && !w.text.startsWith("'") && !w.text.startsWith("-")
+        && !/^[.,!?;:)]/.test(w.text);
+      return acc + (needsSpace ? ' ' : '') + w.text;
+    }, '');
 
-  const handleFontSizeChange = useCallback((value: number) => {
-    onUpdateStyle({ fontSize: value });
-  }, [onUpdateStyle]);
+  // Local text state — synced from captionData, committed on blur
+  const fullText = joinWords(captionData.words);
+  const [editedText, setEditedText] = useState(fullText);
 
-  const handleFontWeightChange = useCallback((value: 'normal' | 'bold' | 'black') => {
-    onUpdateStyle({ fontWeight: value });
-  }, [onUpdateStyle]);
+  // Local style state — buffered until "Apply Changes"
+  const [localFontFamily, setLocalFontFamily] = useState(style.fontFamily);
+  const [localFontSize, setLocalFontSize] = useState(style.fontSize);
+  const [localFontWeight, setLocalFontWeight] = useState(style.fontWeight);
+  const [localColor, setLocalColor] = useState(style.color);
+  const [localStrokeColor, setLocalStrokeColor] = useState(style.strokeColor || '#000000');
+  const [localStrokeWidth, setLocalStrokeWidth] = useState(style.strokeWidth || 0);
+  const [localPosition, setLocalPosition] = useState(style.position);
+  const [localAnimation, setLocalAnimation] = useState(style.animation);
+  const [localHighlightColor, setLocalHighlightColor] = useState(style.highlightColor || '#FFD700');
+  const [localTimeOffset, setLocalTimeOffset] = useState(style.timeOffset || 0);
 
-  const handleColorChange = useCallback((value: string) => {
-    onUpdateStyle({ color: value });
-  }, [onUpdateStyle]);
+  // Keep in sync when a different clip is selected
+  useEffect(() => {
+    setEditedText(joinWords(captionData.words));
+    setLocalFontFamily(style.fontFamily);
+    setLocalFontSize(style.fontSize);
+    setLocalFontWeight(style.fontWeight);
+    setLocalColor(style.color);
+    setLocalStrokeColor(style.strokeColor || '#000000');
+    setLocalStrokeWidth(style.strokeWidth || 0);
+    setLocalPosition(style.position);
+    setLocalAnimation(style.animation);
+    setLocalHighlightColor(style.highlightColor || '#FFD700');
+    setLocalTimeOffset(style.timeOffset || 0);
+  }, [captionData]);
 
-  const handleStrokeColorChange = useCallback((value: string) => {
-    onUpdateStyle({ strokeColor: value });
-  }, [onUpdateStyle]);
+  const handleTextBlur = useCallback(() => {
+    if (editedText.trim() !== fullText.trim()) {
+      onUpdateWords(editedText);
+    }
+  }, [editedText, fullText, onUpdateWords]);
 
-  const handleStrokeWidthChange = useCallback((value: number) => {
-    onUpdateStyle({ strokeWidth: value });
-  }, [onUpdateStyle]);
-
-  const handlePositionChange = useCallback((value: 'top' | 'center' | 'bottom') => {
-    onUpdateStyle({ position: value });
-  }, [onUpdateStyle]);
-
-  const handleAnimationChange = useCallback((value: CaptionStyle['animation']) => {
-    onUpdateStyle({ animation: value });
-  }, [onUpdateStyle]);
-
-  const handleHighlightColorChange = useCallback((value: string) => {
-    onUpdateStyle({ highlightColor: value });
-  }, [onUpdateStyle]);
-
-  // Get caption text preview
-  const textPreview = captionData.words.slice(0, 3).map(w => w.text).join(' ') +
-    (captionData.words.length > 3 ? '...' : '');
+  const handleApply = useCallback(() => {
+    onUpdateStyle({
+      fontFamily: localFontFamily,
+      fontSize: localFontSize,
+      fontWeight: localFontWeight,
+      color: localColor,
+      strokeColor: localStrokeColor,
+      strokeWidth: localStrokeWidth,
+      position: localPosition,
+      animation: localAnimation,
+      highlightColor: localHighlightColor,
+      timeOffset: localTimeOffset,
+    });
+  }, [
+    onUpdateStyle,
+    localFontFamily, localFontSize, localFontWeight,
+    localColor, localStrokeColor, localStrokeWidth,
+    localPosition, localAnimation, localHighlightColor, localTimeOffset,
+  ]);
 
   return (
     <div className="flex flex-col h-full">
@@ -94,15 +124,23 @@ export default function CaptionPropertiesPanel({
         </button>
       </div>
 
-      {/* Caption preview */}
+      {/* Caption text editor */}
       <div className="px-3 py-2 border-b border-zinc-800/50">
-        <div className="flex items-center gap-2 text-xs text-white font-medium">
+        <div className="flex items-center gap-2 mb-1.5">
           <Type className="w-3.5 h-3.5 text-purple-400" />
-          <span className="truncate">{textPreview || 'Caption'}</span>
+          <span className="text-xs font-medium text-zinc-300">Caption Text</span>
+          <span className="text-[10px] text-zinc-500 ml-auto">{captionData.words.length} words</span>
         </div>
-        <div className="text-[10px] text-zinc-500 mt-0.5">
-          {captionData.words.length} words
-        </div>
+        <textarea
+          value={editedText}
+          onChange={(e) => setEditedText(e.target.value)}
+          onBlur={handleTextBlur}
+          onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.currentTarget.blur(); } }}
+          rows={2}
+          className="w-full px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded text-xs text-white resize-none focus:outline-none focus:border-purple-500 leading-relaxed"
+          placeholder="Caption text..."
+        />
+        <div className="text-[10px] text-zinc-500 mt-0.5">Press Enter or click away to apply</div>
       </div>
 
       {/* Properties */}
@@ -114,8 +152,8 @@ export default function CaptionPropertiesPanel({
             <span className="text-xs font-medium text-zinc-300">Font</span>
           </div>
           <select
-            value={style.fontFamily}
-            onChange={(e) => handleFontChange(e.target.value)}
+            value={localFontFamily}
+            onChange={(e) => setLocalFontFamily(e.target.value)}
             className="w-full px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded text-xs text-white"
           >
             {FONT_OPTIONS.map(opt => (
@@ -128,15 +166,15 @@ export default function CaptionPropertiesPanel({
         <div>
           <div className="flex items-center justify-between mb-2">
             <span className="text-xs font-medium text-zinc-300">Size</span>
-            <span className="text-xs text-zinc-400">{style.fontSize}px</span>
+            <span className="text-xs text-zinc-400">{localFontSize}px</span>
           </div>
           <input
             type="range"
             min="24"
             max="96"
             step="2"
-            value={style.fontSize}
-            onChange={(e) => handleFontSizeChange(parseInt(e.target.value))}
+            value={localFontSize}
+            onChange={(e) => setLocalFontSize(parseInt(e.target.value))}
             className="w-full h-1.5 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-purple-500"
           />
         </div>
@@ -148,9 +186,9 @@ export default function CaptionPropertiesPanel({
             {(['normal', 'bold', 'black'] as const).map(weight => (
               <button
                 key={weight}
-                onClick={() => handleFontWeightChange(weight)}
+                onClick={() => setLocalFontWeight(weight)}
                 className={`flex-1 px-2 py-1 text-xs rounded transition-colors ${
-                  style.fontWeight === weight
+                  localFontWeight === weight
                     ? 'bg-purple-500 text-white'
                     : 'bg-zinc-700 text-zinc-300 hover:bg-zinc-600'
                 }`}
@@ -172,8 +210,8 @@ export default function CaptionPropertiesPanel({
               <label className="text-[10px] text-zinc-500 mb-1 block">Text</label>
               <input
                 type="color"
-                value={style.color}
-                onChange={(e) => handleColorChange(e.target.value)}
+                value={localColor}
+                onChange={(e) => setLocalColor(e.target.value)}
                 className="w-full h-8 rounded cursor-pointer bg-zinc-800 border border-zinc-700"
               />
             </div>
@@ -181,8 +219,8 @@ export default function CaptionPropertiesPanel({
               <label className="text-[10px] text-zinc-500 mb-1 block">Stroke</label>
               <input
                 type="color"
-                value={style.strokeColor || '#000000'}
-                onChange={(e) => handleStrokeColorChange(e.target.value)}
+                value={localStrokeColor}
+                onChange={(e) => setLocalStrokeColor(e.target.value)}
                 className="w-full h-8 rounded cursor-pointer bg-zinc-800 border border-zinc-700"
               />
             </div>
@@ -193,15 +231,15 @@ export default function CaptionPropertiesPanel({
         <div>
           <div className="flex items-center justify-between mb-2">
             <span className="text-xs font-medium text-zinc-300">Stroke Width</span>
-            <span className="text-xs text-zinc-400">{style.strokeWidth || 0}px</span>
+            <span className="text-xs text-zinc-400">{localStrokeWidth}px</span>
           </div>
           <input
             type="range"
             min="0"
             max="6"
             step="1"
-            value={style.strokeWidth || 0}
-            onChange={(e) => handleStrokeWidthChange(parseInt(e.target.value))}
+            value={localStrokeWidth}
+            onChange={(e) => setLocalStrokeWidth(parseInt(e.target.value))}
             className="w-full h-1.5 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-purple-500"
           />
         </div>
@@ -216,9 +254,9 @@ export default function CaptionPropertiesPanel({
             {POSITION_OPTIONS.map(opt => (
               <button
                 key={opt.value}
-                onClick={() => handlePositionChange(opt.value as 'top' | 'center' | 'bottom')}
+                onClick={() => setLocalPosition(opt.value as 'top' | 'center' | 'bottom')}
                 className={`flex-1 px-2 py-1 text-xs rounded transition-colors ${
-                  style.position === opt.value
+                  localPosition === opt.value
                     ? 'bg-purple-500 text-white'
                     : 'bg-zinc-700 text-zinc-300 hover:bg-zinc-600'
                 }`}
@@ -233,8 +271,8 @@ export default function CaptionPropertiesPanel({
         <div>
           <span className="text-xs font-medium text-zinc-300 block mb-2">Animation</span>
           <select
-            value={style.animation}
-            onChange={(e) => handleAnimationChange(e.target.value as CaptionStyle['animation'])}
+            value={localAnimation}
+            onChange={(e) => setLocalAnimation(e.target.value as CaptionStyle['animation'])}
             className="w-full px-2 py-1.5 bg-zinc-800 border border-zinc-700 rounded text-xs text-white"
           >
             {ANIMATION_OPTIONS.map(opt => (
@@ -244,13 +282,13 @@ export default function CaptionPropertiesPanel({
         </div>
 
         {/* Highlight Color (for karaoke) */}
-        {style.animation === 'karaoke' && (
+        {localAnimation === 'karaoke' && (
           <div>
             <label className="text-xs font-medium text-zinc-300 block mb-2">Highlight Color</label>
             <input
               type="color"
-              value={style.highlightColor || '#FFD700'}
-              onChange={(e) => handleHighlightColorChange(e.target.value)}
+              value={localHighlightColor}
+              onChange={(e) => setLocalHighlightColor(e.target.value)}
               className="w-full h-8 rounded cursor-pointer bg-zinc-800 border border-zinc-700"
             />
           </div>
@@ -260,15 +298,15 @@ export default function CaptionPropertiesPanel({
         <div>
           <div className="flex items-center justify-between mb-2">
             <span className="text-xs font-medium text-zinc-300">Time Offset</span>
-            <span className="text-xs text-zinc-400">{(style.timeOffset || 0).toFixed(1)}s</span>
+            <span className="text-xs text-zinc-400">{localTimeOffset.toFixed(1)}s</span>
           </div>
           <input
             type="range"
             min="-5"
             max="5"
             step="0.1"
-            value={style.timeOffset || 0}
-            onChange={(e) => onUpdateStyle({ timeOffset: parseFloat(e.target.value) })}
+            value={localTimeOffset}
+            onChange={(e) => setLocalTimeOffset(parseFloat(e.target.value))}
             className="w-full h-1.5 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-purple-500"
           />
           <div className="flex justify-between text-[10px] text-zinc-500 mt-1">
@@ -276,6 +314,17 @@ export default function CaptionPropertiesPanel({
             <span>Later</span>
           </div>
         </div>
+      </div>
+
+      {/* Apply Changes button */}
+      <div className="px-3 py-2 border-t border-zinc-800/50">
+        <button
+          onClick={handleApply}
+          className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-purple-600 hover:bg-purple-500 text-white text-xs font-medium rounded-lg transition-colors"
+        >
+          <Check className="w-3.5 h-3.5" />
+          Apply Changes
+        </button>
       </div>
     </div>
   );

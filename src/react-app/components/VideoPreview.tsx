@@ -18,13 +18,21 @@ interface ClipTransform {
 interface ClipLayer {
   id: string;
   url: string;
-  type: 'video' | 'image' | 'audio' | 'caption';
+  type: 'video' | 'image' | 'audio' | 'caption' | 'lower-third';
   trackId: string;
   clipTime: number;
   transform?: ClipTransform;
   // Caption-specific data
   captionWords?: CaptionWord[];
   captionStyle?: CaptionStyle;
+  // Lower-third banner overlay data
+  bannerData?: {
+    lines: string[];
+    bgcolor: string;
+    textcolor: string;
+    fontFamily?: string;
+    cropAspectRatio: string;
+  };
 }
 
 interface VideoPreviewProps {
@@ -409,7 +417,62 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
               words={layer.captionWords}
               style={layer.captionStyle}
               currentTime={layer.clipTime}
+              aspectRatio={aspectRatio}
             />
+          );
+        }
+
+        if (layer.type === 'lower-third' && layer.bannerData) {
+          const { lines, bgcolor, textcolor, fontFamily, cropAspectRatio } = layer.bannerData;
+
+          // Compute the banner position/width to match the actual video content area.
+          // With object-contain, a video narrower than the container is letterboxed horizontally.
+          // containerAspect = width/height ratio of the preview container.
+          // videoAspect = width/height ratio of the face-cropped video.
+          const parseAR = (ar: string) => { const [w, h] = ar.split(':').map(Number); return w / h; };
+          const containerAspect = parseAR(aspectRatio);
+          const videoAspect = cropAspectRatio ? parseAR(cropAspectRatio) : containerAspect;
+
+          let bannerLeft = '0';
+          let bannerWidth = '100%';
+          if (videoAspect < containerAspect) {
+            // Video is narrower than container — horizontal letterboxing
+            const widthRatio = videoAspect / containerAspect;
+            bannerWidth = `${widthRatio * 100}%`;
+            bannerLeft = `${(1 - widthRatio) / 2 * 100}%`;
+          }
+
+          return (
+            <div
+              key={layer.id}
+              className="absolute bottom-0 pointer-events-none"
+              style={{
+                left: bannerLeft,
+                width: bannerWidth,
+                backgroundColor: bgcolor,
+                opacity: 0.92,
+                zIndex: (styles.zIndex as number) || 50,
+                padding: '6px 10px 8px',
+              }}
+            >
+              {lines.map((line, i) => (
+                <div
+                  key={i}
+                  style={{
+                    color: textcolor,
+                    fontFamily: fontFamily || 'Inter',
+                    fontSize: i === 0 ? '13px' : '11px',
+                    fontWeight: i === 0 ? '700' : '600',
+                    lineHeight: '1.35',
+                    textShadow: '1px 1px 2px rgba(0,0,0,0.5)',
+                    whiteSpace: 'normal',
+                    wordBreak: 'break-word',
+                  }}
+                >
+                  {line}
+                </div>
+              ))}
+            </div>
           );
         }
 

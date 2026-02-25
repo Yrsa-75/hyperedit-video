@@ -57,13 +57,14 @@ export const LowerThird: React.FC<LowerThirdProps> = ({
             marginRight: 16,
           }} />
           {/* Content */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxWidth: 600 }}>
             <div style={{
               color: textColor,
               fontSize: 32,
               fontWeight: 'bold',
               fontFamily: 'Inter, system-ui, sans-serif',
               textShadow: '1px 1px 4px rgba(0,0,0,0.5)',
+              wordBreak: 'break-word',
             }}>
               {name}
             </div>
@@ -73,6 +74,7 @@ export const LowerThird: React.FC<LowerThirdProps> = ({
                 fontSize: 18,
                 fontWeight: '500',
                 fontFamily: 'Inter, system-ui, sans-serif',
+                wordBreak: 'break-word',
               }}>
                 {title}
               </div>
@@ -102,6 +104,8 @@ export const LowerThird: React.FC<LowerThirdProps> = ({
             fontFamily: 'Inter, system-ui, sans-serif',
             textShadow: '1px 1px 4px rgba(0,0,0,0.5)',
             transform: `translateX(${translateX}px)`,
+            maxWidth: 600,
+            wordBreak: 'break-word',
           }}>
             {name}
             {title && <span style={{ color: 'rgba(255,255,255,0.7)', fontWeight: '400' }}> — {title}</span>}
@@ -132,7 +136,8 @@ export const LowerThird: React.FC<LowerThirdProps> = ({
           <div style={{
             backgroundColor: primaryColor,
             padding: '20px 40px',
-            display: 'inline-block',
+            display: 'block',
+            maxWidth: 700,
           }}>
             <div style={{
               color: textColor,
@@ -141,6 +146,7 @@ export const LowerThird: React.FC<LowerThirdProps> = ({
               fontFamily: 'Inter, system-ui, sans-serif',
               textTransform: 'uppercase',
               letterSpacing: 2,
+              wordBreak: 'break-word',
             }}>
               {name}
             </div>
@@ -149,13 +155,14 @@ export const LowerThird: React.FC<LowerThirdProps> = ({
             <div style={{
               backgroundColor: 'rgba(0,0,0,0.8)',
               padding: '12px 40px',
-              display: 'inline-block',
-              marginLeft: 0,
+              display: 'block',
+              maxWidth: 700,
             }}>
               <div style={{
                 color: textColor,
                 fontSize: 20,
                 fontFamily: 'Inter, system-ui, sans-serif',
+                wordBreak: 'break-word',
               }}>
                 {title}
               </div>
@@ -182,12 +189,14 @@ export const LowerThird: React.FC<LowerThirdProps> = ({
             padding: '16px 32px',
             borderRadius: 8,
             boxShadow: '0 4px 20px rgba(0,0,0,0.3)',
+            maxWidth: 600,
           }}>
             <div style={{
               color: textColor,
               fontSize: 28,
               fontWeight: 'bold',
               fontFamily: 'Inter, system-ui, sans-serif',
+              wordBreak: 'break-word',
             }}>
               {name}
             </div>
@@ -197,6 +206,7 @@ export const LowerThird: React.FC<LowerThirdProps> = ({
                 fontSize: 16,
                 fontFamily: 'Inter, system-ui, sans-serif',
                 marginTop: 4,
+                wordBreak: 'break-word',
               }}>
                 {title}
               </div>
@@ -218,42 +228,49 @@ export const LowerThird: React.FC<LowerThirdProps> = ({
           transform: `translateX(${translateX}px)`,
           opacity,
           display: 'flex',
+          maxWidth: 700,
         }}>
           {/* Red accent */}
           <div style={{
             width: 8,
             backgroundColor: '#dc2626',
+            flexShrink: 0,
           }} />
-          {/* Name box */}
-          <div style={{
-            backgroundColor: primaryColor,
-            padding: '14px 24px',
-          }}>
+          {/* Text stack */}
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            {/* Name box */}
             <div style={{
-              color: textColor,
-              fontSize: 26,
-              fontWeight: 'bold',
-              fontFamily: 'Inter, system-ui, sans-serif',
-              textTransform: 'uppercase',
-            }}>
-              {name}
-            </div>
-          </div>
-          {/* Title box */}
-          {title && (
-            <div style={{
-              backgroundColor: 'rgba(0,0,0,0.85)',
+              backgroundColor: primaryColor,
               padding: '14px 24px',
             }}>
               <div style={{
                 color: textColor,
-                fontSize: 20,
+                fontSize: 26,
+                fontWeight: 'bold',
                 fontFamily: 'Inter, system-ui, sans-serif',
+                textTransform: 'uppercase',
+                wordBreak: 'break-word',
               }}>
-                {title}
+                {name}
               </div>
             </div>
-          )}
+            {/* Title box */}
+            {title && (
+              <div style={{
+                backgroundColor: 'rgba(0,0,0,0.85)',
+                padding: '14px 24px',
+              }}>
+                <div style={{
+                  color: textColor,
+                  fontSize: 20,
+                  fontFamily: 'Inter, system-ui, sans-serif',
+                  wordBreak: 'break-word',
+                }}>
+                  {title}
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       </AbsoluteFill>
     );

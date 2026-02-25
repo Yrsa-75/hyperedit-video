@@ -69,10 +69,22 @@ export default function Timeline({
   const [zoom, setZoom] = useState(1);
   const [isDraggingPlayhead, setIsDraggingPlayhead] = useState(false);
   const [dragOverTrack, setDragOverTrack] = useState<string | null>(null);
+  const [multiSelectedIds, setMultiSelectedIds] = useState<Set<string>>(new Set());
+  const [selectionBox, setSelectionBox] = useState<{ startX: number; startY: number; endX: number; endY: number } | null>(null);
+  const [isDrawingSelection, setIsDrawingSelection] = useState(false);
 
   const timelineRef = useRef<HTMLDivElement>(null);
   const tracksContainerRef = useRef<HTMLDivElement>(null);
   const trackHeadersRef = useRef<HTMLDivElement>(null);
+
+  // Refs for stale-closure–safe access inside document event handlers
+  const clipsRef = useRef(clips);
+  useEffect(() => { clipsRef.current = clips; }, [clips]);
+  const multiSelectedIdsRef = useRef(multiSelectedIds);
+  useEffect(() => { multiSelectedIdsRef.current = multiSelectedIds; }, [multiSelectedIds]);
+  const selectionBoxRef = useRef(selectionBox);
+  useEffect(() => { selectionBoxRef.current = selectionBox; }, [selectionBox]);
+  const multiDragInitialStarts = useRef<Map<string, number> | null>(null);
 
   // Sync vertical scroll between track headers and tracks content
   useEffect(() => {
@@ -91,13 +103,13 @@ export default function Timeline({
   // Keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Delete selected clip with Delete or Backspace key
-      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedClipId) {
-        // Don't trigger if user is typing in an input
-        if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
-          return;
-        }
-        e.preventDefault();
+      if (e.key !== 'Delete' && e.key !== 'Backspace') return;
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      e.preventDefault();
+      if (multiSelectedIdsRef.current.size > 1) {
+        multiSelectedIdsRef.current.forEach(id => onDeleteClip(id));
+        setMultiSelectedIds(new Set());
+      } else if (selectedClipId) {
         onDeleteClip(selectedClipId);
       }
     };
@@ -139,6 +151,17 @@ export default function Timeline({
     clips.filter(c => c.trackId === trackId),
     [clips]
   );
+
+  // Y pixel bounds of each track in the scrollable content area (ruler = 24px, then tracks stacked)
+  const trackYOffsets = useMemo(() => {
+    const offsets: Record<string, { top: number; bottom: number }> = {};
+    let y = 24; // ruler height (h-6)
+    sortedTracks.forEach(track => {
+      offsets[track.id] = { top: y, bottom: y + TRACK_HEIGHTS[track.type] };
+      y += TRACK_HEIGHTS[track.type];
+    });
+    return offsets;
+  }, [sortedTracks]);
 
   // Handle clicking on timeline to seek
   const handleTimelineClick = useCallback((e: React.MouseEvent) => {
@@ -210,6 +233,94 @@ export default function Timeline({
     }
   }, [pixelsPerSecond, onDropAsset]);
 
+  // Ctrl+click: toggle clip in multi-selection
+  const handleClipCtrlClick = useCallback((clipId: string) => {
+    setMultiSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(clipId)) next.delete(clipId);
+      else next.add(clipId);
+      return next;
+    });
+    onSelectClip(clipId);
+  }, [onSelectClip]);
+
+  // Multi-drag: record initial positions of all selected clips at drag start
+  const handleMultiDragStart = useCallback(() => {
+    const map = new Map<string, number>();
+    multiSelectedIdsRef.current.forEach(id => {
+      const clip = clipsRef.current.find(c => c.id === id);
+      if (clip) map.set(id, clip.start);
+    });
+    multiDragInitialStarts.current = map;
+  }, []);
+
+  // Multi-drag: apply delta to all selected clips from their initial positions
+  const handleMultiDragDelta = useCallback((delta: number) => {
+    multiDragInitialStarts.current?.forEach((initialStart, clipId) => {
+      onMoveClip(clipId, Math.max(0, initialStart + delta));
+    });
+  }, [onMoveClip]);
+
+  // Rubber band: start selection box on mousedown over empty track area
+  const handleTracksMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button !== 0 || !tracksContainerRef.current) return;
+    const rect = tracksContainerRef.current.getBoundingClientRect();
+    const x = e.clientX - rect.left + tracksContainerRef.current.scrollLeft;
+    const y = e.clientY - rect.top + tracksContainerRef.current.scrollTop;
+    setMultiSelectedIds(new Set());
+    onSelectClip(null);
+    setSelectionBox({ startX: x, startY: y, endX: x, endY: y });
+    setIsDrawingSelection(true);
+  }, [onSelectClip]);
+
+  // Rubber band: document-level move/up handlers while drawing selection
+  useEffect(() => {
+    if (!isDrawingSelection) return;
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!tracksContainerRef.current) return;
+      const rect = tracksContainerRef.current.getBoundingClientRect();
+      const x = e.clientX - rect.left + tracksContainerRef.current.scrollLeft;
+      const y = e.clientY - rect.top + tracksContainerRef.current.scrollTop;
+      setSelectionBox(prev => prev ? { ...prev, endX: x, endY: y } : null);
+    };
+
+    const handleMouseUp = () => {
+      const box = selectionBoxRef.current;
+      if (box) {
+        const boxLeft = Math.min(box.startX, box.endX);
+        const boxRight = Math.max(box.startX, box.endX);
+        const boxTop = Math.min(box.startY, box.endY);
+        const boxBottom = Math.max(box.startY, box.endY);
+        if (boxRight - boxLeft > 5 || boxBottom - boxTop > 5) {
+          const selected = new Set<string>();
+          clipsRef.current.forEach(clip => {
+            const tb = trackYOffsets[clip.trackId];
+            if (!tb) return;
+            const clipLeft = clip.start * pixelsPerSecond;
+            const clipRight = (clip.start + clip.duration) * pixelsPerSecond;
+            if (clipLeft < boxRight && clipRight > boxLeft && tb.top < boxBottom && tb.bottom > boxTop) {
+              selected.add(clip.id);
+            }
+          });
+          if (selected.size > 0) {
+            setMultiSelectedIds(selected);
+            onSelectClip(selected.values().next().value);
+          }
+        }
+      }
+      setIsDrawingSelection(false);
+      setSelectionBox(null);
+    };
+
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [isDrawingSelection, trackYOffsets, pixelsPerSecond, onSelectClip]);
+
   // Get asset for a clip
   const getAssetForClip = useCallback((clip: TimelineClipType) =>
     assets.find(a => a.id === clip.assetId),
@@ -262,10 +373,17 @@ export default function Timeline({
               <Scissors className="w-3.5 h-3.5" />
             </button>
             <button
-              onClick={() => selectedClipId && onDeleteClip(selectedClipId)}
-              disabled={!selectedClipId}
+              onClick={() => {
+                if (multiSelectedIds.size > 1) {
+                  multiSelectedIds.forEach(id => onDeleteClip(id));
+                  setMultiSelectedIds(new Set());
+                } else if (selectedClipId) {
+                  onDeleteClip(selectedClipId);
+                }
+              }}
+              disabled={!selectedClipId && multiSelectedIds.size === 0}
               className="p-1.5 bg-zinc-700 hover:bg-red-600 disabled:opacity-40 disabled:hover:bg-zinc-700 rounded transition-colors"
-              title="Delete selected clip (Delete key)"
+              title={multiSelectedIds.size > 1 ? `Delete ${multiSelectedIds.size} selected clips` : 'Delete selected clip (Delete key)'}
             >
               <Trash2 className="w-3.5 h-3.5" />
             </button>
@@ -350,7 +468,6 @@ export default function Timeline({
           >
             {sortedTracks.map(track => {
               const trackClipCount = clips.filter(c => c.trackId === track.id).length;
-              const isTextTrack = track.type === 'text' && trackClipCount > 0;
 
               return (
                 <div
@@ -359,12 +476,12 @@ export default function Timeline({
                   style={{ height: TRACK_HEIGHTS[track.type] }}
                 >
                   <span className="truncate">{track.name}</span>
-                  {isTextTrack && (
+                  {trackClipCount > 0 && (
                     <button
-                      title={`Delete all ${trackClipCount} captions`}
+                      title={`Delete all ${trackClipCount} clip${trackClipCount > 1 ? 's' : ''} on ${track.name}`}
                       className="p-0.5 rounded hover:bg-red-500/20 hover:text-red-400 transition-colors flex-shrink-0"
                       onClick={() => {
-                        if (confirm(`Delete all ${trackClipCount} captions on ${track.name}?`)) {
+                        if (confirm(`Delete all ${trackClipCount} clip${trackClipCount > 1 ? 's' : ''} on ${track.name}?`)) {
                           clips
                             .filter(c => c.trackId === track.id)
                             .forEach(c => onDeleteClip(c.id));
@@ -412,7 +529,7 @@ export default function Timeline({
             </div>
 
             {/* Tracks */}
-            <div onClick={handleTimelineClick}>
+            <div onClick={handleTimelineClick} onMouseDown={handleTracksMouseDown}>
               {sortedTracks.map(track => {
                 const trackClips = getTrackClips(track.id);
                 const isDragOver = dragOverTrack === track.id;
@@ -459,10 +576,11 @@ export default function Timeline({
                     {trackClips.map(clip => {
                       const captionData = getCaptionData?.(clip.id);
                       const isCaption = track.type === 'text';
-                      const captionPreview = captionData?.words
+                      const captionWords = captionData?.words ?? [];
+                      const captionPreview = captionWords
                         .slice(0, 5)
                         .map(w => w.text)
-                        .join(' ') + (captionData && captionData.words.length > 5 ? '...' : '');
+                        .join(' ') + (captionWords.length > 5 ? '...' : '');
 
                       return (
                         <TimelineClip
@@ -471,14 +589,21 @@ export default function Timeline({
                           asset={getAssetForClip(clip)}
                           pixelsPerSecond={pixelsPerSecond}
                           isSelected={selectedClipId === clip.id}
+                          isMultiSelected={multiSelectedIds.has(clip.id)}
                           trackHeight={TRACK_HEIGHTS[track.type]}
-                          onClick={() => onSelectClip(clip.id)}
+                          onClick={() => {
+                            setMultiSelectedIds(new Set());
+                            onSelectClip(clip.id);
+                          }}
+                          onCtrlClick={() => handleClipCtrlClick(clip.id)}
                           onMove={(newStart) => onMoveClip(clip.id, newStart)}
                           onResize={(inPoint, outPoint, newStart) =>
                             onResizeClip(clip.id, inPoint, outPoint, newStart)
                           }
                           onDelete={() => onDeleteClip(clip.id)}
                           onDragEnd={onSave}
+                          onMultiDragStart={handleMultiDragStart}
+                          onMultiDragDelta={handleMultiDragDelta}
                           isCaption={isCaption}
                           captionPreview={captionPreview}
                         />
@@ -489,9 +614,22 @@ export default function Timeline({
               })}
             </div>
 
+            {/* Rubber band selection box */}
+            {selectionBox && (
+              <div
+                className="absolute pointer-events-none border border-blue-400/80 bg-blue-400/10 z-40 rounded-sm"
+                style={{
+                  left: Math.min(selectionBox.startX, selectionBox.endX),
+                  top: Math.min(selectionBox.startY, selectionBox.endY),
+                  width: Math.abs(selectionBox.endX - selectionBox.startX),
+                  height: Math.abs(selectionBox.endY - selectionBox.startY),
+                }}
+              />
+            )}
+
             {/* Playhead */}
             <div
-              className="absolute top-0 bottom-0 w-0.5 bg-orange-500 z-40 pointer-events-none"
+              className="absolute top-0 bottom-0 w-0.5 bg-orange-500 z-50 pointer-events-none"
               style={{ left: `${currentTime * pixelsPerSecond}px` }}
             >
               {/* Playhead handle */}

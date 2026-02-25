@@ -23,7 +23,7 @@ def suppress_stdout():
 
 import whisper
 
-def transcribe(audio_path, model_size="base"):
+def transcribe(audio_path, model_size="base", initial_prompt=None):
     """Transcribe audio file with word-level timestamps."""
 
     # Load model (will download on first use)
@@ -33,6 +33,9 @@ def transcribe(audio_path, model_size="base"):
     print(f"Loading Whisper model '{model_size}'...", file=sys.stderr)
     model = whisper.load_model(model_size)
 
+    if initial_prompt:
+        print(f"Using context prompt: {initial_prompt[:80]}...", file=sys.stderr)
+
     print(f"Transcribing {audio_path}...", file=sys.stderr)
 
     # Suppress Whisper's "Detected language" output
@@ -40,7 +43,8 @@ def transcribe(audio_path, model_size="base"):
         result = model.transcribe(
             audio_path,
             word_timestamps=True,
-            verbose=False
+            verbose=False,
+            initial_prompt=initial_prompt,
         )
 
     # Extract word-level timestamps
@@ -69,9 +73,10 @@ if __name__ == "__main__":
 
     audio_file = sys.argv[1]
     model_size = sys.argv[2] if len(sys.argv) > 2 else "base"
+    initial_prompt = sys.argv[3] if len(sys.argv) > 3 else None
 
     try:
-        transcribe(audio_file, model_size)
+        transcribe(audio_file, model_size, initial_prompt)
     except Exception as e:
         error_msg = str(e)
         print(f"Error: {error_msg}", file=sys.stderr)

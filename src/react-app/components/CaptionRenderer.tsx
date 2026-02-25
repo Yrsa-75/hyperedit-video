@@ -5,9 +5,10 @@ interface CaptionRendererProps {
   words: CaptionWord[];
   style: CaptionStyle;
   currentTime: number;  // Time within the caption clip
+  aspectRatio?: '16:9' | '9:16';
 }
 
-export default function CaptionRenderer({ words, style, currentTime }: CaptionRendererProps) {
+export default function CaptionRenderer({ words, style, currentTime, aspectRatio = '16:9' }: CaptionRendererProps) {
   // Apply time offset (negative = captions appear earlier, positive = later)
   const adjustedTime = currentTime - (style.timeOffset || 0);
 
@@ -38,25 +39,47 @@ export default function CaptionRenderer({ words, style, currentTime }: CaptionRe
 
   // Get position styles
   const positionStyles = useMemo((): React.CSSProperties => {
+    const isActual916 = aspectRatio === '9:16';
+
+    // In an actual 9:16 container the frame is already 9:16, so use simple left/right padding.
+    // In a 16:9 container with constrainTo916, constrain to the center 9:16 safe column
+    // (9/16)² × 100% ≈ 31.64% of frame width.
+    const use916SafeZone = !isActual916 && style.constrainTo916;
+    const captionWidth = use916SafeZone ? '31.64%' : '90%';
+
     const base: React.CSSProperties = {
       position: 'absolute',
       left: '50%',
       transform: 'translateX(-50%)',
       textAlign: 'center',
-      width: '90%',
-      maxWidth: '90%',
+      width: captionWidth,
+      maxWidth: captionWidth,
+    };
+
+    // Simple left/right padding style (used for actual 9:16 frames and normal 16:9)
+    const paddedBase: React.CSSProperties = {
+      position: 'absolute',
+      left: '5%',
+      right: '5%',
+      textAlign: 'center',
     };
 
     switch (style.position) {
       case 'top':
-        return { ...base, top: '8%' };
+        return use916SafeZone
+          ? { ...base, top: '8%' }
+          : { ...paddedBase, top: '8%' };
       case 'center':
-        return { ...base, top: '50%', transform: 'translate(-50%, -50%)' };
+        return use916SafeZone
+          ? { ...base, top: '50%', transform: 'translate(-50%, -50%)' }
+          : { ...paddedBase, top: '50%', transform: 'translateY(-50%)' };
       case 'bottom':
       default:
-        return { ...base, bottom: '8%' };
+        return use916SafeZone
+          ? { ...base, bottom: '25%' }
+          : { ...paddedBase, bottom: '25%' };
     }
-  }, [style.position]);
+  }, [style.position, style.constrainTo916, aspectRatio]);
 
   // Get text styles
   const textStyles = useMemo((): React.CSSProperties => {
@@ -126,15 +149,26 @@ export default function CaptionRenderer({ words, style, currentTime }: CaptionRe
   return (
     <div style={positionStyles} className="pointer-events-none z-40">
       <div style={textStyles}>
-        {visibleWords.map(({ word, index }, i) => (
-          <span
-            key={`${index}-${word.text}`}
-            style={getWordStyle(index, word)}
-          >
-            {word.text}
-            {i < visibleWords.length - 1 ? ' ' : ''}
-          </span>
-        ))}
+        {visibleWords.map(({ word, index }, i) => {
+          const nextText = i < visibleWords.length - 1 ? visibleWords[i + 1].word.text : null;
+          // No space when current word ends with apostrophe (e.g. "c'" + "est" → "c'est")
+          // or next word starts with apostrophe or punctuation
+          const addSpace = nextText !== null
+            && !word.text.endsWith("'")
+            && !word.text.endsWith("-")
+            && !nextText.startsWith("'")
+            && !nextText.startsWith("-")
+            && !/^[.,!?;:)]/.test(nextText);
+          return (
+            <span
+              key={`${index}-${word.text}`}
+              style={getWordStyle(index, word)}
+            >
+              {word.text}
+              {addSpace ? ' ' : ''}
+            </span>
+          );
+        })}
       </div>
     </div>
   );

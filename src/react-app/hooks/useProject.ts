@@ -15,6 +15,9 @@ export interface Asset {
   thumbnailUrl: string | null;
   streamUrl?: string; // URL with cache-busting timestamp
   aiGenerated?: boolean; // True if this is a Remotion-generated animation
+  sourceAssetId?: string; // Set on face-cropped assets — points to the original
+  cropAspectRatio?: string; // Aspect ratio used when face-cropping ('9:16' | '1:1' | '16:9')
+  bannerSegments?: { lines: string[]; startTime: number; endTime: number }[]; // Detected lower-thirds
 }
 
 // TimelineClip - instance on timeline
@@ -36,6 +39,15 @@ export interface TimelineClip {
     cropBottom?: number;
     cropLeft?: number;
     cropRight?: number;
+  };
+  // Lower-third banner overlay (no asset file — rendered as HTML in preview)
+  bannerData?: {
+    lines: string[];
+    bgcolor: string;
+    textcolor: string;
+    fontFamily?: string;   // e.g. 'Inter' | 'Roboto' | 'Poppins' | 'Montserrat' | 'Oswald' | 'Bebas Neue'
+    sourceAssetId: string; // Root original asset ID (for re-crop cleanup)
+    cropAspectRatio: string; // Aspect ratio of the cropped video ('9:16' | '1:1' | '16:9')
   };
 }
 
@@ -67,6 +79,7 @@ export interface CaptionStyle {
   animation: 'none' | 'karaoke' | 'fade' | 'pop' | 'bounce' | 'typewriter';
   highlightColor?: string;
   timeOffset?: number; // Offset in seconds to adjust sync (negative = earlier, positive = later)
+  constrainTo916?: boolean; // Constrain caption width to the 9:16 safe zone (for vertical crop)
 }
 
 // Caption clip data (stored alongside TimelineClip)
@@ -131,6 +144,7 @@ export function useProject() {
   ]);
   const [clips, setClips] = useState<TimelineClip[]>([]);
   const [captionData, setCaptionData] = useState<Record<string, CaptionData>>({});
+  const [projectFilename, setProjectFilename] = useState('My Project');
 
   // Timeline tabs for editing clips in isolation
   const [timelineTabs, setTimelineTabs] = useState<TimelineTab[]>([
@@ -159,18 +173,73 @@ export function useProject() {
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState('');
   const [serverAvailable, setServerAvailable] = useState<boolean | null>(null);
+  const [renderProgress, setRenderProgress] = useState<number | null>(null);
 
   const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const progressIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Refs to track latest state values for saveProject (avoids stale closure issues)
   const tracksRef = useRef(tracks);
   const clipsRef = useRef(clips);
   const settingsRef = useRef(settings);
+  const captionDataRef = useRef(captionData);
+  const projectFilenameRef = useRef(projectFilename);
 
   // Keep refs in sync with state
   useEffect(() => { tracksRef.current = tracks; }, [tracks]);
   useEffect(() => { clipsRef.current = clips; }, [clips]);
   useEffect(() => { settingsRef.current = settings; }, [settings]);
+  useEffect(() => { captionDataRef.current = captionData; }, [captionData]);
+  useEffect(() => { projectFilenameRef.current = projectFilename; }, [projectFilename]);
+
+  // ── Undo / Redo (two separate stacks, max 10 undo steps) ─────────────────
+  // undoStack: states to restore when undoing (LIFO — last pushed = next undo target)
+  // redoStack: states saved during undo, restored by redo
+  type HistorySnapshot = { clips: TimelineClip[]; captionData: Record<string, CaptionData> };
+  const undoStackRef = useRef<HistorySnapshot[]>([]);
+  const redoStackRef = useRef<HistorySnapshot[]>([]);
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
+
+  const snapshot = (): HistorySnapshot => ({
+    clips: JSON.parse(JSON.stringify(clipsRef.current)) as TimelineClip[],
+    captionData: JSON.parse(JSON.stringify(captionDataRef.current)) as Record<string, CaptionData>,
+  });
+
+  // Call BEFORE any mutating operation to save a restore point.
+  const pushHistory = useCallback(() => {
+    const stack = [...undoStackRef.current, snapshot()].slice(-10); // cap at 10
+    undoStackRef.current = stack;
+    redoStackRef.current = [];   // branching off clears redo history
+    setCanUndo(true);
+    setCanRedo(false);
+  }, []);
+
+  const undo = useCallback(() => {
+    if (undoStackRef.current.length === 0) return;
+    // Save current state so redo can come back
+    redoStackRef.current = [...redoStackRef.current, snapshot()];
+    // Restore last saved state
+    const target = undoStackRef.current[undoStackRef.current.length - 1];
+    undoStackRef.current = undoStackRef.current.slice(0, -1);
+    setClips(JSON.parse(JSON.stringify(target.clips)));
+    setCaptionData(JSON.parse(JSON.stringify(target.captionData)));
+    setCanUndo(undoStackRef.current.length > 0);
+    setCanRedo(true);
+  }, []);
+
+  const redo = useCallback(() => {
+    if (redoStackRef.current.length === 0) return;
+    // Save current state so undo can come back
+    undoStackRef.current = [...undoStackRef.current, snapshot()];
+    // Restore last undone state
+    const target = redoStackRef.current[redoStackRef.current.length - 1];
+    redoStackRef.current = redoStackRef.current.slice(0, -1);
+    setClips(JSON.parse(JSON.stringify(target.clips)));
+    setCaptionData(JSON.parse(JSON.stringify(target.captionData)));
+    setCanUndo(true);
+    setCanRedo(redoStackRef.current.length > 0);
+  }, []);
 
   // Wrapper to persist session to localStorage
   const setSession = useCallback((sessionOrUpdater: SessionInfo | null | ((prev: SessionInfo | null) => SessionInfo | null)) => {
@@ -348,6 +417,9 @@ export function useProject() {
       height?: number;
       thumbnailUrl?: string | null;
       aiGenerated?: boolean;
+      sourceAssetId?: string;
+      cropAspectRatio?: string;
+      bannerSegments?: { lines: string[]; startTime: number; endTime: number }[];
     }) => ({
       id: a.id,
       type: a.type,
@@ -363,6 +435,9 @@ export function useProject() {
       streamUrl: `${LOCAL_FFMPEG_URL}/session/${session.sessionId}/assets/${a.id}/stream?v=${Date.now()}`,
       // Preserve aiGenerated flag for Remotion-generated animations (critical for edit workflow detection)
       aiGenerated: a.aiGenerated || false,
+      sourceAssetId: a.sourceAssetId || undefined,
+      cropAspectRatio: a.cropAspectRatio || undefined,
+      bannerSegments: a.bannerSegments || undefined,
     }));
 
     setAssets(serverAssets);
@@ -403,9 +478,10 @@ export function useProject() {
       outPoint: outPoint ?? clipDuration,
     };
 
+    pushHistory();
     setClips(prev => [...prev, clip]);
     return clip;
-  }, [assets]);
+  }, [assets, pushHistory]);
 
   // Update clip
   const updateClip = useCallback((clipId: string, updates: Partial<TimelineClip>): void => {
@@ -416,6 +492,7 @@ export function useProject() {
 
   // Delete clip (with optional ripple/autosnap to shift subsequent clips)
   const deleteClip = useCallback((clipId: string, ripple: boolean = false): void => {
+    pushHistory();
     setClips(prev => {
       const clipToDelete = prev.find(c => c.id === clipId);
       if (!clipToDelete) return prev.filter(c => c.id !== clipId);
@@ -423,7 +500,8 @@ export function useProject() {
       // Remove the clip
       const filtered = prev.filter(c => c.id !== clipId);
 
-      if (!ripple) return filtered;
+      // Never ripple caption tracks — captions have absolute time positions tied to speech
+      if (!ripple || clipToDelete.trackId === 'T1') return filtered;
 
       // Ripple mode: shift subsequent clips on the same track backward
       const deletedEnd = clipToDelete.start + clipToDelete.duration;
@@ -440,7 +518,7 @@ export function useProject() {
         return c;
       });
     });
-  }, []);
+  }, [pushHistory]);
 
   // Move clip
   const moveClip = useCallback((clipId: string, newStart: number, newTrackId?: string): void => {
@@ -481,6 +559,8 @@ export function useProject() {
       return null; // Split too close to edge
     }
 
+    pushHistory();
+
     // Calculate the in-point offset for the split
     const splitInPoint = clip.inPoint + timeInClip;
 
@@ -510,7 +590,7 @@ export function useProject() {
     ]);
 
     return secondClip.id;
-  }, [clips]);
+  }, [clips, pushHistory]);
 
   // Create a new timeline tab for editing a clip/animation in isolation
   const createTimelineTab = useCallback((name: string, assetId: string, initialClips?: TimelineClip[]): string => {
@@ -657,11 +737,12 @@ export function useProject() {
       style: { ...defaultCaptionStyle, ...style },
     };
 
+    pushHistory();
     setClips(prev => [...prev, clip]);
     setCaptionData(prev => ({ ...prev, [clipId]: captionInfo }));
 
     return clip;
-  }, []);
+  }, [pushHistory]);
 
   // Add multiple caption clips at once (batched for performance)
   const addCaptionClipsBatch = useCallback((
@@ -695,14 +776,16 @@ export function useProject() {
     }
 
     // Single state update for all clips
+    pushHistory();
     setClips(prev => [...prev, ...newClips]);
     setCaptionData(prev => ({ ...prev, ...newCaptionData }));
 
     return newClips;
-  }, []);
+  }, [pushHistory]);
 
   // Update caption style
   const updateCaptionStyle = useCallback((clipId: string, styleUpdates: Partial<CaptionStyle>): void => {
+    pushHistory();
     setCaptionData(prev => {
       const existing = prev[clipId];
       if (!existing) return prev;
@@ -713,6 +796,29 @@ export function useProject() {
           style: { ...existing.style, ...styleUpdates },
         },
       };
+    });
+  }, [pushHistory]);
+
+  // Update caption words (text editing), remapping timestamps to fit new word count
+  const updateCaptionWords = useCallback((clipId: string, newText: string): void => {
+    setCaptionData(prev => {
+      const existing = prev[clipId];
+      if (!existing) return prev;
+      const newWordTokens = newText.trim().split(/\s+/).filter(w => w.length > 0);
+      const oldWords = existing.words;
+      const totalStart = oldWords[0]?.start ?? 0;
+      const totalEnd = oldWords[oldWords.length - 1]?.end ?? totalStart + 1;
+      const avgDuration = oldWords.length > 0 ? (totalEnd - totalStart) / oldWords.length : 0.3;
+      const updatedWords: CaptionWord[] = newWordTokens.map((text, i) => {
+        if (i < oldWords.length) {
+          return { text, start: oldWords[i].start, end: oldWords[i].end };
+        }
+        // Extra words appended: extend from the last known timestamp
+        const prev2 = i > 0 ? updatedWords[i - 1] : oldWords[oldWords.length - 1];
+        const start = prev2 ? prev2.end : totalEnd;
+        return { text, start, end: start + avgDuration };
+      });
+      return { ...prev, [clipId]: { ...existing, words: updatedWords } };
     });
   }, []);
 
@@ -741,6 +847,8 @@ export function useProject() {
             tracks: tracksRef.current,
             clips: clipsRef.current,
             settings: settingsRef.current,
+            captionData: captionDataRef.current,
+            projectFilename: projectFilenameRef.current,
           }),
         });
         console.log('[Project] Saved');
@@ -796,6 +904,8 @@ export function useProject() {
         // Server tracks may be outdated (e.g., missing T1, V3, A2)
         if (data.clips) setClips(data.clips);
         if (data.settings) setSettings(data.settings);
+        if (data.captionData) setCaptionData(data.captionData);
+        if (data.projectFilename) setProjectFilename(data.projectFilename);
       }
     } catch (error) {
       console.error('[Project] Load failed:', error);
@@ -804,14 +914,28 @@ export function useProject() {
 
   // Render project
   // Uses refs to always get latest state
-  const renderProject = useCallback(async (preview = false): Promise<string> => {
+  const renderProject = useCallback(async (preview = false, exportWidth?: number, exportHeight?: number): Promise<string> => {
     if (!session) throw new Error('No session');
 
     setLoading(true);
+    setRenderProgress(0);
     setStatus(preview ? 'Rendering preview...' : 'Rendering export...');
 
+    // Start polling progress every second
+    progressIntervalRef.current = setInterval(async () => {
+      try {
+        const res = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/progress`);
+        if (res.ok) {
+          const prog = await res.json();
+          setRenderProgress(prog.progress ?? 0);
+        }
+      } catch {
+        // ignore polling errors
+      }
+    }, 1000);
+
     try {
-      // Save project first - use refs to get latest state
+      // Save project first - use refs to get latest state (include captionData for burn-in)
       await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/project`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -819,13 +943,19 @@ export function useProject() {
           tracks: tracksRef.current,
           clips: clipsRef.current,
           settings: settingsRef.current,
+          captionData: captionDataRef.current,
+          projectFilename: projectFilenameRef.current,
         }),
       });
+
+      const renderBody: Record<string, unknown> = { preview };
+      if (exportWidth) renderBody.width = exportWidth;
+      if (exportHeight) renderBody.height = exportHeight;
 
       const response = await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/render`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ preview }),
+        body: JSON.stringify(renderBody),
       });
 
       if (!response.ok) {
@@ -834,13 +964,25 @@ export function useProject() {
       }
 
       const result = await response.json();
+      setRenderProgress(100);
       setStatus('Render complete!');
 
-      // Return download URL
-      return `${LOCAL_FFMPEG_URL}${result.downloadUrl}`;
+      // Return download URL — include dimensions so server can compute the format label
+      let downloadUrl = `${LOCAL_FFMPEG_URL}${result.downloadUrl}`;
+      if (!preview && exportWidth && exportHeight) {
+        downloadUrl += `?w=${exportWidth}&h=${exportHeight}`;
+      }
+      return downloadUrl;
     } finally {
+      if (progressIntervalRef.current) {
+        clearInterval(progressIntervalRef.current);
+        progressIntervalRef.current = null;
+      }
       setLoading(false);
-      setTimeout(() => setStatus(''), 2000);
+      setTimeout(() => {
+        setStatus('');
+        setRenderProgress(null);
+      }, 2000);
     }
   }, [session]);
 
@@ -936,6 +1078,7 @@ export function useProject() {
     loading,
     status,
     serverAvailable,
+    renderProgress,
 
     // Session
     checkServer,
@@ -948,6 +1091,13 @@ export function useProject() {
     getAssetStreamUrl,
     refreshAssets,
     createGif,
+
+    // Undo / Redo
+    undo,
+    redo,
+    canUndo,
+    canRedo,
+    pushHistory,
 
     // Clips
     addClip,
@@ -962,6 +1112,7 @@ export function useProject() {
     addCaptionClip,
     addCaptionClipsBatch,
     updateCaptionStyle,
+    updateCaptionWords,
     getCaptionData,
 
     // Project
@@ -969,6 +1120,10 @@ export function useProject() {
     loadProject,
     renderProject,
     getDuration,
+
+    // Project name
+    projectFilename,
+    setProjectFilename,
 
     // Setters for direct state manipulation
     setTracks,

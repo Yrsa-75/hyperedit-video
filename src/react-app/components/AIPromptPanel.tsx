@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Sparkles, Send, Wand2, Clock, Terminal, CheckCircle, Loader2, VolumeX, FileVideo, Type, Image, Zap, X, Scissors, Plus, Film, Music, MapPin, Timer, ImagePlus, Move } from 'lucide-react';
+import { Sparkles, Send, Wand2, Clock, Terminal, CheckCircle, Loader2, VolumeX, FileVideo, Type, Image, Zap, X, Scissors, Plus, Film, Music, MapPin, Timer, ImagePlus, Move, Crop } from 'lucide-react';
 import type { TimelineClip, Track, Asset } from '@/react-app/hooks/useProject';
 import { MOTION_TEMPLATES, type TemplateId } from '@/remotion/templates';
 import MotionGraphicsPanel from './MotionGraphicsPanel';
@@ -63,6 +63,7 @@ interface ChatMessage {
 interface CaptionOptions {
   highlightColor: string;
   fontFamily: string;
+  constrainTo916?: boolean;
 }
 
 interface ChapterCutResult {
@@ -181,6 +182,7 @@ interface AIPromptPanelProps {
   onExtractAudio?: () => Promise<ExtractAudioResult>;
   onOpenAnimationInTab?: (assetId: string, animationName: string) => string | undefined;
   onEditAnimation?: (assetId: string, editPrompt: string, v1Context?: EditTabV1Context, tabIdToUpdate?: string) => Promise<{ assetId: string; duration: number; sceneCount: number }>;
+  onFaceCrop?: (assetId: string, aspectRatio: string) => Promise<{ assetId: string; facesDetected: number }>;
   isApplying?: boolean;
   applyProgress?: number;
   applyStatus?: string;
@@ -215,6 +217,7 @@ export default function AIPromptPanel({
   onExtractAudio,
   onOpenAnimationInTab,
   onEditAnimation,
+  onFaceCrop,
   isApplying,
   applyProgress,
   applyStatus,
@@ -233,6 +236,7 @@ export default function AIPromptPanel({
   const [processingStatus, setProcessingStatus] = useState('');
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [showCaptionOptions, setShowCaptionOptions] = useState(false);
+  const [isCaptionFor916, setIsCaptionFor916] = useState(false);
   const [showQuickActions, setShowQuickActions] = useState(false);
   const [showReferencePicker, setShowReferencePicker] = useState(false);
   const [selectedReferences, setSelectedReferences] = useState<TimelineReference[]>([]);
@@ -539,9 +543,32 @@ export default function AIPromptPanel({
     'Inter', 'Roboto', 'Poppins', 'Montserrat', 'Oswald', 'Bebas Neue', 'Arial', 'Helvetica'
   ];
 
-  const suggestions = [
+  const suggestions: Array<{ icon: React.ElementType; text: string; onAction?: () => void }> = [
     { icon: Type, text: 'Add captions' },
+    {
+      icon: Type,
+      text: 'Add captions for 9:16',
+      onAction: () => {
+        if (!hasVideo) {
+          setChatHistory(prev => [...prev, {
+            type: 'assistant',
+            text: 'Please upload a video first.',
+          }]);
+          setShowQuickActions(false);
+          return;
+        }
+        setIsCaptionFor916(true);
+        setCaptionOptions(prev => ({ ...prev, constrainTo916: true }));
+        setChatHistory(prev => [...prev, {
+          type: 'assistant',
+          text: 'Configure your caption style below, then click "Add Captions" to start.\n\n📱 Captions will be constrained to the 9:16 safe zone.',
+        }]);
+        setShowCaptionOptions(true);
+        setShowQuickActions(false);
+      },
+    },
     { icon: VolumeX, text: 'Remove dead air / silence' },
+    { icon: Crop, text: 'Smart crop for TikTok/Reels (9:16)' },
     { icon: Wand2, text: 'Remove background noise' },
     { icon: Clock, text: 'Speed up by 1.5x' },
     { icon: FileVideo, text: 'Add GIF animations' },
@@ -890,6 +917,7 @@ export default function AIPromptPanel({
     | 'transcript-animation' // Kinetic typography from speech
     | 'contextual-animation' // Animation based on video content
     | 'extract-audio'       // Extract audio to separate track
+    | 'face-crop'           // Face-tracking smart crop / reframe
     | 'ffmpeg-edit'         // Direct FFmpeg video manipulation
     | 'unknown';            // Need to ask for clarification
 
@@ -974,6 +1002,15 @@ export default function AIPromptPanel({
     if (lower.includes('dead air') || lower.includes('silence') ||
         lower.includes('remove quiet') || lower.includes('remove pauses')) {
       return 'dead-air';
+    }
+
+    // Face-tracking smart crop
+    if (lower.includes('smart crop') || lower.includes('face crop') ||
+        lower.includes('face-crop') || lower.includes('reframe') ||
+        lower.includes('tiktok') || lower.includes('reels') ||
+        (lower.includes('vertical') && (lower.includes('crop') || lower.includes('format') || lower.includes('video'))) ||
+        lower.includes('portrait mode') || lower.includes('9:16')) {
+      return 'face-crop';
     }
 
     // Extract audio from video
@@ -1177,7 +1214,10 @@ export default function AIPromptPanel({
   const handleCaptionWorkflow = async () => {
     if (!onTranscribeAndAddCaptions) return;
 
+    const is916 = isCaptionFor916;
     setShowCaptionOptions(false);
+    setIsCaptionFor916(false);
+    setCaptionOptions(prev => ({ ...prev, constrainTo916: undefined }));
     setIsProcessing(true);
     setProcessingStatus('Starting transcription...');
 
@@ -1189,7 +1229,7 @@ export default function AIPromptPanel({
         isCaptionWorkflow: true,
       }]);
 
-      await onTranscribeAndAddCaptions(captionOptions);
+      await onTranscribeAndAddCaptions({ ...captionOptions, constrainTo916: is916 });
 
       // Update the last message to show completion
       setChatHistory(prev => {
@@ -1278,7 +1318,7 @@ export default function AIPromptPanel({
           name: nameMatch?.[1]?.trim() || 'John Doe',
           title: titleMatch?.[1]?.trim() || 'CEO & Founder',
         },
-        duration: 4,
+        duration: 8,
         startTime: currentTime,
       };
     }
@@ -1814,6 +1854,65 @@ export default function AIPromptPanel({
     }
   };
 
+  // Handle face-tracking smart crop workflow
+  const handleFaceCropWorkflow = async (aspectRatio: string) => {
+    if (!onFaceCrop) return;
+
+    setIsProcessing(true);
+    setProcessingStatus('Detecting faces...');
+
+    // Find primary video asset
+    const primaryAsset = assets.find(a => a.type === 'video' && !a.aiGenerated) || assets.find(a => a.type === 'video');
+    if (!primaryAsset) {
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: 'Please upload a video first.',
+      }]);
+      setIsProcessing(false);
+      setProcessingStatus('');
+      return;
+    }
+
+    try {
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: `🎯 Detecting faces and applying smart crop to ${aspectRatio}...\n\n1. Sampling frames for face detection\n2. Computing smooth crop path\n3. Re-encoding video with FFmpeg\n\nThis may take a moment...`,
+        isProcessingGifs: true,
+      }]);
+
+      const result = await onFaceCrop(primaryAsset.id, aspectRatio);
+
+      setChatHistory(prev => {
+        const updated = [...prev];
+        const lastIdx = updated.length - 1;
+        if (updated[lastIdx]?.isProcessingGifs) {
+          const faceMsg = result.facesDetected > 0
+            ? `${result.facesDetected} face${result.facesDetected !== 1 ? 's' : ''} detected`
+            : 'no faces detected — centered crop applied';
+          updated[lastIdx] = {
+            ...updated[lastIdx],
+            text: `✅ Smart crop complete! Cropped to ${aspectRatio} – ${faceMsg}.\n\nThe cropped video has been added to your timeline.`,
+            isProcessingGifs: false,
+            applied: true,
+            isDeadAirWorkflow: true,
+          };
+        }
+        return updated;
+      });
+
+    } catch (error) {
+      console.error('Face crop workflow error:', error);
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: `❌ Smart crop failed: ${errorMessage}`,
+      }]);
+    } finally {
+      setIsProcessing(false);
+      setProcessingStatus('');
+    }
+  };
+
   // Handle transcript animation workflow (kinetic typography from speech)
   const handleTranscriptAnimationWorkflow = async () => {
     if (!onGenerateTranscriptAnimation) return;
@@ -2121,6 +2220,21 @@ export default function AIPromptPanel({
         return;
       }
       await handleDeadAirWorkflow();
+      return;
+    }
+
+    // Face-tracking smart crop
+    if (workflow === 'face-crop') {
+      if (!hasVideo) {
+        setChatHistory(prev => [...prev, {
+          type: 'assistant',
+          text: 'Please upload a video first. I\'ll then detect faces and apply a smart crop.',
+        }]);
+        return;
+      }
+      // Detect aspect ratio from prompt (default 9:16 for TikTok/Reels)
+      const ar = userMessage.includes('1:1') ? '1:1' : userMessage.includes('16:9') ? '16:9' : '9:16';
+      await handleFaceCropWorkflow(ar);
       return;
     }
 
@@ -2545,7 +2659,12 @@ export default function AIPromptPanel({
       {showCaptionOptions && (
         <div className="p-4 border-t border-zinc-800/50 bg-zinc-800/50">
           <div className="space-y-3">
-            <div className="text-xs font-medium text-zinc-300">Caption Style</div>
+            <div className="flex items-center gap-2">
+              <div className="text-xs font-medium text-zinc-300">Caption Style</div>
+              {isCaptionFor916 && (
+                <span className="text-xs px-1.5 py-0.5 bg-orange-500/20 text-orange-400 rounded font-medium">9:16 mode</span>
+              )}
+            </div>
 
             {/* Font Selection */}
             <div className="flex items-center gap-2">
@@ -2576,7 +2695,7 @@ export default function AIPromptPanel({
             {/* Action Buttons */}
             <div className="flex gap-2 pt-2">
               <button
-                onClick={() => setShowCaptionOptions(false)}
+                onClick={() => { setShowCaptionOptions(false); setIsCaptionFor916(false); setCaptionOptions(prev => ({ ...prev, constrainTo916: undefined })); }}
                 className="flex-1 px-3 py-2 bg-zinc-700 hover:bg-zinc-600 rounded-lg text-xs font-medium transition-colors"
               >
                 Cancel
@@ -2632,8 +2751,12 @@ export default function AIPromptPanel({
                     key={idx}
                     type="button"
                     onClick={() => {
-                      setPrompt(suggestion.text);
-                      setShowQuickActions(false);
+                      if (suggestion.onAction) {
+                        suggestion.onAction();
+                      } else {
+                        setPrompt(suggestion.text);
+                        setShowQuickActions(false);
+                      }
                     }}
                     className="flex items-center gap-2 px-3 py-2.5 bg-zinc-700/50 hover:bg-zinc-700 rounded-lg text-xs text-left transition-colors group"
                   >

@@ -7,32 +7,38 @@ interface TimelineClipProps {
   asset: Asset | undefined;
   pixelsPerSecond: number;
   isSelected: boolean;
+  isMultiSelected?: boolean;
   trackHeight: number;
   onClick: () => void;
+  onCtrlClick?: () => void;
   onMove: (newStart: number) => void;
   onResize: (newInPoint: number, newOutPoint: number, newStart?: number) => void;
   onDragEnd: () => void;
   onDelete: () => void;
+  onMultiDragStart?: () => void;
+  onMultiDragDelta?: (delta: number) => void;
   captionPreview?: string;  // For caption clips - first few words
   isCaption?: boolean;       // Whether this is a caption clip
 }
 
-const getAssetIcon = (type?: Asset['type'] | 'caption') => {
+const getAssetIcon = (type?: Asset['type'] | 'caption' | 'banner') => {
   switch (type) {
     case 'video': return Film;
     case 'image': return Image;
     case 'audio': return Music;
     case 'caption': return Type;
+    case 'banner': return Type;
     default: return Film;
   }
 };
 
-const getClipColor = (type?: Asset['type'] | 'caption') => {
+const getClipColor = (type?: Asset['type'] | 'caption' | 'banner') => {
   switch (type) {
     case 'video': return 'from-blue-500 to-cyan-500';
     case 'image': return 'from-amber-500 to-orange-500';
     case 'audio': return 'from-emerald-500 to-teal-500';
     case 'caption': return 'from-purple-500 to-pink-500';
+    case 'banner': return 'from-rose-500 to-pink-600';
     default: return 'from-gray-500 to-gray-600';
   }
 };
@@ -42,12 +48,16 @@ export default function TimelineClip({
   asset,
   pixelsPerSecond,
   isSelected,
+  isMultiSelected = false,
   trackHeight,
   onClick,
+  onCtrlClick,
   onMove,
   onResize,
   onDragEnd,
   onDelete,
+  onMultiDragStart,
+  onMultiDragDelta,
   captionPreview,
   isCaption = false,
 }: TimelineClipProps) {
@@ -61,8 +71,10 @@ export default function TimelineClip({
 
   const clipRef = useRef<HTMLDivElement>(null);
 
-  const Icon = getAssetIcon(isCaption ? 'caption' : asset?.type);
-  const colorClass = getClipColor(isCaption ? 'caption' : asset?.type);
+  const isBanner = !!clip.bannerData;
+  const clipType = isBanner ? 'banner' : isCaption ? 'caption' : asset?.type;
+  const Icon = getAssetIcon(clipType);
+  const colorClass = getClipColor(clipType);
 
   const left = clip.start * pixelsPerSecond + 1; // 1px offset for visual gap
   const width = Math.max(clip.duration * pixelsPerSecond - 2, 30); // -2px for visual gap between clips
@@ -70,6 +82,14 @@ export default function TimelineClip({
   // Handle dragging for moving the clip
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     if (e.button !== 0) return;
+
+    // Ctrl/Meta click = toggle multi-select, don't drag
+    if (e.ctrlKey || e.metaKey) {
+      e.preventDefault();
+      e.stopPropagation();
+      onCtrlClick?.();
+      return;
+    }
 
     // Check if clicking on resize handles
     const rect = clipRef.current?.getBoundingClientRect();
@@ -94,11 +114,14 @@ export default function TimelineClip({
       setIsDragging(true);
       setDragStartX(e.clientX);
       setInitialStart(clip.start);
+      if (isMultiSelected) {
+        onMultiDragStart?.();
+      }
     }
 
     e.preventDefault();
     e.stopPropagation();
-  }, [clip.inPoint, clip.outPoint, clip.start]);
+  }, [clip.inPoint, clip.outPoint, clip.start, isMultiSelected, onCtrlClick, onMultiDragStart]);
 
   // Handle mouse move for dragging/resizing
   useEffect(() => {
@@ -109,8 +132,13 @@ export default function TimelineClip({
       const deltaTime = deltaX / pixelsPerSecond;
 
       if (isDragging) {
-        const newStart = Math.max(0, initialStart + deltaTime);
-        onMove(newStart);
+        if (isMultiSelected && onMultiDragDelta) {
+          // Let Timeline move all selected clips together via initial-position + delta
+          onMultiDragDelta(deltaTime);
+        } else {
+          const newStart = Math.max(0, initialStart + deltaTime);
+          onMove(newStart);
+        }
       } else if (isResizingLeft) {
         // Resize from left - changes inPoint and start
         const newInPoint = Math.max(0, initialInPoint + deltaTime);
@@ -158,6 +186,8 @@ export default function TimelineClip({
     onMove,
     onResize,
     onDragEnd,
+    isMultiSelected,
+    onMultiDragDelta,
   ]);
 
   return (
@@ -165,7 +195,7 @@ export default function TimelineClip({
       ref={clipRef}
       onClick={(e) => {
         e.stopPropagation();
-        onClick();
+        if (!e.ctrlKey && !e.metaKey) onClick();
       }}
       onMouseDown={handleMouseDown}
       className={`absolute rounded-md bg-gradient-to-r ${colorClass} ${
@@ -173,9 +203,11 @@ export default function TimelineClip({
           ? 'opacity-80 scale-105 shadow-xl shadow-black/50 z-30 cursor-grabbing ring-2 ring-orange-400'
           : isResizingLeft || isResizingRight
             ? 'cursor-ew-resize z-20 ring-2 ring-orange-400'
-            : isSelected
-              ? 'ring-2 ring-orange-400 shadow-lg shadow-orange-500/30 z-20 cursor-grab'
-              : 'ring-1 ring-orange-500/50 hover:ring-orange-400 z-10 cursor-grab'
+            : isMultiSelected
+              ? 'ring-2 ring-blue-400 shadow-lg shadow-blue-500/20 z-20 cursor-grab'
+              : isSelected
+                ? 'ring-2 ring-orange-400 shadow-lg shadow-orange-500/30 z-20 cursor-grab'
+                : 'ring-1 ring-orange-500/50 hover:ring-orange-400 z-10 cursor-grab'
       } transition-all duration-75`}
       style={{
         left: `${left}px`,
@@ -222,7 +254,11 @@ export default function TimelineClip({
 
         {/* Name or Caption Preview */}
         <span className="text-xs font-medium truncate">
-          {isCaption ? (captionPreview || 'Caption') : (asset?.filename || 'Unknown')}
+          {isBanner
+            ? (clip.bannerData!.lines[0] || 'Lower Third')
+            : isCaption
+              ? (captionPreview || 'Caption')
+              : (asset?.filename || 'Unknown')}
         </span>
 
         {/* AI-generated indicator */}
