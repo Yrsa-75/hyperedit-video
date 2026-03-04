@@ -1,0 +1,22 @@
+# ============================================================
+# ClipWise – Railway deployment configuration
+# Docs: https://docs.railway.app/reference/config-as-code
+# ============================================================
+
+[build]
+# Railway auto-detects the Dockerfile in the repo root
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "node scripts/local-ffmpeg-server.js"
+healthcheckPath = "/health"
+healthcheckTimeout = 300   # seconds – Whisper model loads slowly on first start
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+[[volumes]]
+# Persistent disk mounted at /data so session files survive deployments/restarts.
+# Create this volume in the Railway dashboard: Settings → Volumes → Add Volume
+# Mount path must match SESSIONS_BASE_DIR env var in Dockerfile
+mountPath = "/data"

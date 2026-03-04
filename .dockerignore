@@ -1,0 +1,30 @@
+# Git
+.git
+.gitignore
+
+# Dependencies (re-installed inside Docker)
+node_modules
+
+# Build artifacts
+dist
+.wrangler
+
+# Local dev secrets (never include in Docker image)
+.dev.vars
+.env
+.env.local
+
+# Logs and temp files
+*.log
+temp-fonts/
+CHECKPOINT.txt
+
+# Editor / OS
+.vscode
+.idea
+*.DS_Store
+Thumbs.db
+
+# Docker itself
+Dockerfile
+.dockerignore

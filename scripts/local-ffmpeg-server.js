@@ -33,9 +33,12 @@ if (process.env.FAL_API_KEY && !process.env.FAL_KEY) {
   process.env.FAL_KEY = process.env.FAL_API_KEY;
 }
 
-const PORT = 3333;
-const TEMP_DIR = join(tmpdir(), 'hyperedit-ffmpeg');
+const PORT = parseInt(process.env.PORT || '3333', 10);
+const TEMP_DIR = process.env.SESSIONS_BASE_DIR || join(tmpdir(), 'hyperedit-ffmpeg');
 const SESSIONS_DIR = join(TEMP_DIR, 'sessions');
+
+// Remotion GL renderer: swiftshader for Linux (Docker/Railway), angle for macOS
+const REMOTION_GL_FLAG = process.env.REMOTION_GL || (process.platform === 'linux' ? '--gl=swiftshader' : '--gl=angle');
 
 // Active video sessions - keeps videos on disk between edits
 const sessions = new Map();
@@ -3974,6 +3977,655 @@ Background: clean, uncluttered.`
   }
 }
 
+// Handle viral shorts creation endpoint
+async function handleCreateViralShorts(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  const jobId = randomUUID().substring(0, 8);
+  const audioPath = join(TEMP_DIR, `${jobId}-viral-audio.mp3`);
+
+  try {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    const { assetId, numClips = 3, durationRange = '15-30' } = JSON.parse(body || '{}');
+
+    const [minDuration, maxDuration] = durationRange.split('-').map(Number);
+
+    // Find video asset
+    let videoAsset = null;
+    if (assetId) {
+      videoAsset = session.assets.get(assetId);
+    } else {
+      for (const asset of session.assets.values()) {
+        if (asset.type === 'video' && !asset.aiGenerated) { videoAsset = asset; break; }
+      }
+      if (!videoAsset) {
+        for (const asset of session.assets.values()) {
+          if (asset.type === 'video') { videoAsset = asset; break; }
+        }
+      }
+    }
+
+    if (!videoAsset) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'No video asset found' }));
+      return;
+    }
+
+    const geminiKey = process.env.GEMINI_API_KEY;
+    if (!geminiKey) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'GEMINI_API_KEY is required for viral short generation' }));
+      return;
+    }
+
+    console.log(`\n[${jobId}] === CREATE VIRAL SHORTS ===`);
+    console.log(`[${jobId}] Video: ${videoAsset.filename}, clips: ${numClips}, duration: ${minDuration}-${maxDuration}s`);
+
+    const totalDuration = await getVideoDuration(videoAsset.path);
+    console.log(`[${jobId}] Video duration: ${totalDuration.toFixed(2)}s`);
+
+    if (totalDuration < minDuration) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: `Video too short (${totalDuration.toFixed(1)}s) for ${minDuration}-${maxDuration}s clips` }));
+      return;
+    }
+
+    // Step 1: Transcribe
+    console.log(`[${jobId}] Extracting audio...`);
+    await runFFmpeg([
+      '-y', '-i', videoAsset.path,
+      '-vn', '-acodec', 'libmp3lame',
+      '-ab', '64k', '-ar', '16000', '-ac', '1',
+      audioPath,
+    ], jobId);
+
+    let words = [];
+    const hasLocalWhisper = await checkLocalWhisper();
+
+    if (hasLocalWhisper) {
+      console.log(`[${jobId}] Transcribing with local Whisper...`);
+      const transcription = await runLocalWhisper(audioPath, jobId, null);
+      words = (transcription.words || []).map(w => ({ text: w.text, start: parseFloat(w.start), end: parseFloat(w.end) }));
+    } else {
+      console.log(`[${jobId}] Transcribing with Gemini (segment-level timestamps)...`);
+      const audioBuffer = readFileSync(audioPath);
+      const audioBase64 = audioBuffer.toString('base64');
+      const ai = new GoogleGenAI({ apiKey: geminiKey });
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: [{ role: 'user', parts: [
+          { inlineData: { mimeType: 'audio/mp3', data: audioBase64 } },
+          { text: `Transcribe this audio (duration: ${totalDuration.toFixed(1)}s) into segments of 1-3 sentences each. Estimate timestamps for each segment based on the audio timing and typical speech rhythm.
+
+Return ONLY valid JSON, no markdown:
+{"segments":[{"text":"segment text","start":0.0,"end":5.2},{"text":"next segment","start":5.2,"end":11.0}]}
+
+Rules:
+- Cover the full audio from start to finish
+- Each segment end = next segment start
+- Last segment end ≈ ${totalDuration.toFixed(1)}
+- Timestamps in seconds (decimals allowed)` },
+        ]}],
+      });
+
+      const transcriptText = response.text || '';
+      console.log(`[${jobId}] Gemini response (${transcriptText.length} chars): ${transcriptText.substring(0, 500)}`);
+
+      // Parse segments — try JSON, markdown block, then regex
+      const parseSegments = (text) => {
+        const tryParse = (s) => {
+          try {
+            const p = JSON.parse(s);
+            return p.segments || p.words || null;
+          } catch { return null; }
+        };
+        // 1. Direct
+        const direct = tryParse(text);
+        if (direct?.length) return direct;
+        // 2. Markdown block
+        const block = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+        if (block) { const r = tryParse(block[1].trim()); if (r?.length) return r; }
+        // 3. Extract JSON object
+        const obj = text.match(/\{[\s\S]*\}/);
+        if (obj) { const r = tryParse(obj[0]); if (r?.length) return r; }
+        // 4. Regex: extract start/end/text triples
+        const results = [];
+        const re = /"start"\s*:\s*([\d.]+)[\s\S]{0,50}?"end"\s*:\s*([\d.]+)[\s\S]{0,300}?"text"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+        for (const m of text.matchAll(re)) {
+          results.push({ start: parseFloat(m[1]), end: parseFloat(m[2]), text: m[3] });
+        }
+        if (results.length > 0) return results;
+        // 5. text before start/end
+        const re2 = /"text"\s*:\s*"((?:[^"\\]|\\.)*)"[\s\S]{0,50}?"start"\s*:\s*([\d.]+)[\s\S]{0,50}?"end"\s*:\s*([\d.]+)/g;
+        for (const m of text.matchAll(re2)) {
+          results.push({ text: m[1], start: parseFloat(m[2]), end: parseFloat(m[3]) });
+        }
+        return results;
+      };
+
+      const segments = parseSegments(transcriptText);
+      console.log(`[${jobId}] Gemini segments parsed: ${segments?.length || 0}`);
+
+      if (segments?.length) {
+        // Convert segments to words (one synthetic "word" per segment for downstream processing)
+        for (const seg of segments) {
+          const text = (seg.text || '').replace(/["\\\n\r]/g, ' ').trim();
+          const start = parseFloat(seg.start) || 0;
+          const end = parseFloat(seg.end) || start + 5;
+          if (text) words.push({ text, start, end });
+        }
+      }
+      console.log(`[${jobId}] Gemini transcription: ${words.length} segments as words`);
+    }
+
+    try { unlinkSync(audioPath); } catch {}
+    console.log(`[${jobId}] Transcription: ${words.length} words`);
+
+    if (words.length === 0) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'Could not transcribe video — make sure it has clear spoken audio' }));
+      return;
+    }
+
+    // Step 2: Group words into sentences based on actual speech pauses.
+    // KEY PRINCIPLE: pause duration is the only reliable signal — Whisper adds punctuation
+    // based on grammar rules, not physical stops. Never break mid-speech just because a
+    // period or comma appears; only break when the speaker actually pauses.
+    //
+    // Break conditions (in priority order):
+    //  1. Long pause ≥ 1.0s → speaker clearly stopped → always break
+    //  2. Sentence-end punctuation (.!?) AND pause ≥ 0.4s → confirmed sentence end with breath
+    //  3. Word ceiling 50 words → absolute safety valve
+    // Punctuation alone (no pause) never breaks — speaker is still talking.
+    const sentences = [];
+    let currentWords = [];
+    let sentenceStart = null;
+    for (let i = 0; i < words.length; i++) {
+      const w = words[i];
+      if (sentenceStart === null) sentenceStart = w.start;
+      currentWords.push(w.text);
+      const nextWord = words[i + 1];
+      const gapToNext = nextWord ? (nextWord.start - w.end) : 0;
+
+      const isHardEnd    = /[.!?]$/.test(w.text);
+      const hasLongPause = gapToNext >= 1.0;   // clear stop
+      const hasBreath    = gapToNext >= 0.4;   // short breath after sentence end
+      const isAtCeiling  = currentWords.length >= 20;
+
+      const shouldBreak =
+        hasLongPause ||
+        (isHardEnd && hasBreath) ||
+        isAtCeiling ||
+        i === words.length - 1;
+
+      if (shouldBreak) {
+        const text = currentWords.join(' ').replace(/["\\\n\r]/g, ' ').trim();
+        // pauseAfter: how long the speaker pauses after this sentence — used to prefer
+        // cutting at natural speech breaks rather than arbitrary sentence boundaries.
+        sentences.push({ start: sentenceStart, end: w.end, text, pauseAfter: gapToNext });
+        currentWords = [];
+        sentenceStart = null;
+      }
+    }
+
+    // Helper: snap a time range to the nearest sentence boundaries.
+    // End snap: prefer snapping forward (include full last sentence) but only up to
+    // MAX_FORWARD_SNAP seconds — beyond that, snap backward to avoid duration blowout.
+    const MAX_FORWARD_SNAP = 3; // seconds
+    const snapToSentenceBoundaries = (reqStart, reqEnd) => {
+      if (sentences.length === 0) return { start: reqStart, end: reqEnd };
+
+      // Find sentence whose START is closest to reqStart.
+      // Strongly prefer sentences that are preceded by a long pause (>= 1.0s) — these
+      // are natural speech break points that produce clean-sounding cuts.
+      let bestStartIdx = 0;
+      let bestStartDist = Infinity;
+      for (let i = 0; i < sentences.length; i++) {
+        const timeDist = Math.abs(sentences[i].start - reqStart);
+        // Sentences preceded by a long pause cost at full timeDist;
+        // soft boundaries (no long pause before them) cost 3× to deprioritise them.
+        const prevPause = i > 0 ? sentences[i - 1].pauseAfter : 1.0; // treat video start as hard boundary
+        const penalty = prevPause >= 1.0 ? 1 : 3;
+        const dist = timeDist * penalty;
+        if (dist < bestStartDist) { bestStartDist = dist; bestStartIdx = i; }
+      }
+
+      // Find sentence whose END is closest to reqEnd.
+      // Same preference for long-pause boundaries; forward snap limited to MAX_FORWARD_SNAP.
+      let bestEndIdx = bestStartIdx;
+      let bestEndDist = Infinity;
+      for (let i = bestStartIdx; i < sentences.length; i++) {
+        const end = sentences[i].end;
+        const forwardOvershoot = end - reqEnd; // positive = past requested end
+        if (forwardOvershoot > MAX_FORWARD_SNAP) break;
+        const rawDist = end >= reqEnd ? forwardOvershoot : (reqEnd - end) * 2;
+        // Prefer ending where the speaker pauses long (>= 1.0s after this sentence)
+        const pauseBonus = sentences[i].pauseAfter >= 1.0 ? 0.5 : 1;
+        const dist = rawDist * pauseBonus;
+        if (dist < bestEndDist) { bestEndDist = dist; bestEndIdx = i; }
+      }
+
+      return { start: sentences[bestStartIdx].start, end: sentences[bestEndIdx].end };
+    };
+
+    // Build compact transcript — include all sentences, cap at 25k chars to stay within Gemini context
+    const MAX_TRANSCRIPT_CHARS = 25000;
+    const transcriptLines = sentences.map((s, idx) => `[${s.start.toFixed(2)}-${s.end.toFixed(2)}s] ${s.text}`);
+    let transcriptForGemini = transcriptLines.join('\n');
+    if (transcriptForGemini.length > MAX_TRANSCRIPT_CHARS) {
+      // Sample evenly so we cover the whole video proportionally
+      const step = sentences.length / Math.floor(MAX_TRANSCRIPT_CHARS / 80);
+      const sampled = [];
+      for (let i = 0; i < sentences.length; i += Math.max(1, Math.round(step))) {
+        sampled.push(transcriptLines[i]);
+        if (sampled.join('\n').length >= MAX_TRANSCRIPT_CHARS) break;
+      }
+      transcriptForGemini = sampled.join('\n');
+    }
+    console.log(`[${jobId}] Transcript: ${sentences.length} sentences → ${transcriptForGemini.length} chars`);
+
+    // Extract video frames evenly for visual context (~1 frame per 15s, max 20)
+    const numFrames = Math.max(4, Math.min(20, Math.floor(totalDuration / 15)));
+    const frameDir = join(TEMP_DIR, `${jobId}-viral-frames`);
+    mkdirSync(frameDir, { recursive: true });
+    const frameParts = [];
+    console.log(`[${jobId}] Extracting ${numFrames} video frames for visual analysis...`);
+    for (let i = 0; i < numFrames; i++) {
+      const t = Math.min((i / (numFrames - 1)) * totalDuration * 0.95, totalDuration - 1);
+      const framePath = join(frameDir, `f${i}.jpg`);
+      try {
+        await runFFmpeg(['-y', '-ss', String(t.toFixed(2)), '-i', videoAsset.path, '-vframes', '1', '-q:v', '4', '-vf', 'scale=640:-1', framePath], jobId);
+        if (existsSync(framePath)) {
+          frameParts.push({
+            inlineData: { mimeType: 'image/jpeg', data: readFileSync(framePath).toString('base64') },
+          });
+          frameParts.push({ text: `[Frame at ${t.toFixed(0)}s]` });
+        }
+      } catch {}
+    }
+    // Cleanup frames
+    try {
+      for (const f of readdirSync(frameDir)) { try { unlinkSync(join(frameDir, f)); } catch {} }
+      rmdirSync(frameDir);
+    } catch {}
+    console.log(`[${jobId}] Captured ${frameParts.length / 2} frames for Gemini`);
+
+    const ai = new GoogleGenAI({ apiKey: geminiKey });
+
+    const segmentPrompt = `You are an expert viral short-form video editor (Opus Clip style) for TikTok, YouTube Shorts, and Instagram Reels.
+
+CONTEXT: The video frames above are spread across a ${totalDuration.toFixed(0)}-second video.
+
+YOUR TASK: Create ${numClips} viral clip(s). Each clip must have a TOTAL playback duration of ${minDuration}–${maxDuration} seconds.
+
+TRANSCRIPT — every line is one sentence with its exact timestamps [start-end]:
+${transcriptForGemini}
+
+══════════════════════════════════════
+THE MULTI-SEGMENT EDITING TECHNIQUE
+══════════════════════════════════════
+Every clip MUST be assembled from 2–4 non-contiguous segments pulled from DIFFERENT PARTS of the video. Skip all filler between the good moments — that is the entire point.
+
+Think of building a highlight reel within a single clip:
+  → Segment 1: The hook — a bold, surprising, or emotional opening line
+  [skip 20-60s of context, setup, tangents, "um"s, slow parts]
+  → Segment 2: The core insight or turning point
+  [skip 10-30s of elaboration, examples you don't need]
+  → Segment 3: The payoff — punchline, revelation, or call to action
+
+This is how Opus Clip works. Never output a single continuous segment.
+
+══════════════════════════════════════
+VIRAL QUALITY CRITERIA
+══════════════════════════════════════
+1. HOOK IN 3 SECONDS — cold-open mid-action or with a bold statement. Never start with "today", "hi everyone", "so basically", slow intros, or transitions.
+2. EMOTIONAL PULL — tension, humour, surprise, awe, controversy, or a relatable struggle. The viewer must FEEL something.
+3. TIGHT PACING — zero filler. Cut every "um", every repeated point, every slow transition. The best 20s spread across 60s of video beats a boring 20s straight.
+4. STRONG ENDING — closes on a COMPLETE thought: a punchline, a revelation, a clear takeaway, or a resolved tension. NEVER end mid-sentence or mid-thought.
+5. STANDALONE — zero prior context needed. No "as I mentioned", "like I said before", "in the previous section".
+
+══════════════════════════════════════
+HARD RULES
+══════════════════════════════════════
+- Segment starts MUST use a sentence START timestamp from the transcript (left number in brackets).
+- Segment ends MUST use a sentence END timestamp from the transcript (right number in brackets).
+- Each segment must be AT LEAST 2 seconds long.
+- Segments within a clip must be in chronological order and must NOT overlap.
+- Different clips must NOT reuse the same time ranges.
+- Total duration across all segments per clip = ${minDuration}–${maxDuration}s. Target the middle of the range (around ${Math.round((minDuration + maxDuration) / 2)}s). Never go below ${minDuration}s.
+- REQUIRED: every clip must have AT LEAST 2 segments. A single-segment clip is NEVER acceptable.
+- Title must be written in the SAME LANGUAGE as the transcript (e.g. French video → French title).
+- Title must be punchy and curiosity-driven — like a viral YouTube title (max 8 words).
+
+══════════════════════════════════════
+REQUIRED OUTPUT FORMAT (JSON only)
+══════════════════════════════════════
+{"clips":[
+  {
+    "title":"Punchy Viral Title Here",
+    "hook":"One sentence: why a stranger will stop scrolling for this",
+    "segments":[
+      {"start":3.20,"end":11.50},
+      {"start":58.40,"end":71.80},
+      {"start":134.10,"end":142.60}
+    ]
+  },
+  {
+    "title":"Another Viral Title",
+    "hook":"Why this clip will get shared",
+    "segments":[
+      {"start":22.00,"end":30.50},
+      {"start":95.70,"end":108.20}
+    ]
+  }
+]}
+
+Return ONLY the JSON above — no markdown, no explanation, no extra text.`;
+
+    console.log(`[${jobId}] Asking Gemini (vision + transcript) to identify ${numClips} viral clip(s)...`);
+    const geminiResponse = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [{
+        role: 'user',
+        parts: [
+          ...frameParts,
+          { text: segmentPrompt },
+        ],
+      }],
+    });
+
+    const rawText = (geminiResponse.text || '').trim();
+    console.log(`[${jobId}] Gemini raw response (${rawText.length} chars):\n${rawText.substring(0, 1200)}`);
+
+    // Parse clips — handle multi-segment format {"clips":[{"segments":[...]}]}
+    // Also accepts old flat {start, end} at clip level as single-segment fallback
+    const extractClips = (text) => {
+      const tryParse = (s) => {
+        try {
+          const p = JSON.parse(s);
+          if (!p.clips?.length) return null;
+          return p.clips.map(clip => {
+            // Old flat format: {"start":x,"end":y} → wrap as single segment (fallback only)
+            if (!clip.segments && (clip.start !== undefined || clip.end !== undefined)) {
+              console.warn(`[${jobId}] WARNING: Gemini returned old flat {start,end} format for clip "${clip.title}" — using single segment fallback`);
+              return { ...clip, segments: [{ start: clip.start, end: clip.end }] };
+            }
+            return clip;
+          });
+        } catch { return null; }
+      };
+      // 1. Direct parse
+      const direct = tryParse(text);
+      if (direct) return direct;
+      // 2. Markdown code block
+      const codeBlock = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+      if (codeBlock) { const r = tryParse(codeBlock[1].trim()); if (r) return r; }
+      // 3. Extract JSON object
+      const obj = text.match(/\{[\s\S]*\}/);
+      if (obj) { const r = tryParse(obj[0]); if (r) return r; }
+      // 4. Regex fallback — extract start/end pairs and treat each as a single-segment clip
+      console.warn(`[${jobId}] WARNING: Could not parse JSON from Gemini response — using regex fallback`);
+      const results = [];
+      const re = /"start"\s*:\s*([\d.]+)[\s\S]{0,400}?"end"\s*:\s*([\d.]+)/g;
+      for (const m of text.matchAll(re)) {
+        results.push({ segments: [{ start: parseFloat(m[1]), end: parseFloat(m[2]) }] });
+      }
+      return results;
+    };
+
+    let clips = extractClips(rawText);
+    if (clips?.length) {
+      clips.forEach((c, i) => console.log(`[${jobId}] Parsed clip ${i + 1} "${c.title || 'untitled'}": ${c.segments?.length || 0} segment(s)`));
+    }
+
+    if (!clips || clips.length === 0) {
+      res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'Failed to identify viral segments — try a longer video with more speech' }));
+      return;
+    }
+
+    // Snap each segment's start/end to actual sentence boundaries and compute total duration
+    const validClips = [];
+    for (const clip of clips) {
+      if (!clip.segments?.length) continue;
+
+      const snappedSegments = [];
+      let totalClipDuration = 0;
+
+      const MIN_SEGMENT_DURATION = 2; // seconds — minimum per segment after snapping
+      for (const seg of clip.segments) {
+        const reqStart = parseFloat(seg.start);
+        const reqEnd = parseFloat(seg.end);
+        if (isNaN(reqStart) || isNaN(reqEnd)) continue;
+        if (reqEnd <= reqStart) { console.warn(`[${jobId}] Segment ${reqStart}-${reqEnd}: reversed timestamps — skipping`); continue; }
+
+        const snapped = snapToSentenceBoundaries(reqStart, reqEnd);
+        const dur = snapped.end - snapped.start;
+
+        if (dur < MIN_SEGMENT_DURATION) {
+          console.warn(`[${jobId}] Segment ${reqStart.toFixed(2)}-${reqEnd.toFixed(2)} → snapped to ${snapped.start.toFixed(2)}-${snapped.end.toFixed(2)} (${dur.toFixed(1)}s < ${MIN_SEGMENT_DURATION}s min) — skipping`);
+          continue;
+        }
+
+        snappedSegments.push({ start: Math.max(0, snapped.start), end: Math.min(snapped.end, totalDuration) });
+        totalClipDuration += dur;
+      }
+
+      if (snappedSegments.length === 0) {
+        console.warn(`[${jobId}] Clip "${clip.title || 'untitled'}" has no valid segments after snapping — skipping`);
+        continue;
+      }
+      if (totalClipDuration < 2) {
+        console.warn(`[${jobId}] Clip "${clip.title || 'untitled'}" total duration ${totalClipDuration.toFixed(1)}s too short — skipping`);
+        continue;
+      }
+
+      // Floor enforcement: if clip is below minDuration, extend the last segment forward
+      // sentence by sentence until we reach minDuration (without exceeding maxDuration).
+      if (totalClipDuration < minDuration && snappedSegments.length > 0) {
+        const lastSeg = snappedSegments[snappedSegments.length - 1];
+        let newEnd = lastSeg.end;
+        for (const s of sentences) {
+          if (s.end <= newEnd) continue;
+          const wouldAdd = s.end - newEnd;
+          if (totalClipDuration + wouldAdd > maxDuration) break;
+          newEnd = s.end;
+          totalClipDuration += wouldAdd;
+          if (totalClipDuration >= minDuration) break;
+        }
+        if (newEnd > lastSeg.end) {
+          snappedSegments[snappedSegments.length - 1] = { ...lastSeg, end: Math.min(newEnd, totalDuration) };
+          console.log(`[${jobId}] Extended clip "${clip.title || 'untitled'}" last segment end ${lastSeg.end.toFixed(1)}s → ${newEnd.toFixed(1)}s to meet minDuration (now ${totalClipDuration.toFixed(1)}s)`);
+        }
+      }
+
+      if (totalClipDuration < minDuration) {
+        console.warn(`[${jobId}] Clip "${clip.title || 'untitled'}" still below minDuration after extension: ${totalClipDuration.toFixed(1)}s < ${minDuration}s`);
+      }
+
+      // Hard duration ceiling: drop trailing segments until within maxDuration.
+      // Keep at least one segment. Trimming the last segment's end to a sentence boundary
+      // that fits is preferred over dropping the whole segment.
+      if (totalClipDuration > maxDuration) {
+        console.warn(`[${jobId}] Clip "${clip.title || 'untitled'}": ${totalClipDuration.toFixed(1)}s exceeds max ${maxDuration}s — trimming`);
+        while (snappedSegments.length > 1 && totalClipDuration > maxDuration) {
+          const dropped = snappedSegments.pop();
+          totalClipDuration -= (dropped.end - dropped.start);
+          console.warn(`[${jobId}]   dropped last segment (${dropped.start.toFixed(1)}-${dropped.end.toFixed(1)}s), now ${totalClipDuration.toFixed(1)}s`);
+        }
+        // If still over with one segment remaining, find the latest sentence end <= maxDuration from segment start
+        if (totalClipDuration > maxDuration && snappedSegments.length === 1) {
+          const seg = snappedSegments[0];
+          const targetEnd = seg.start + maxDuration;
+          let bestEnd = seg.start + MIN_SEGMENT_DURATION; // at minimum, keep MIN_SEGMENT_DURATION
+          for (const s of sentences) {
+            if (s.end > seg.start && s.end <= targetEnd) bestEnd = s.end;
+          }
+          snappedSegments[0] = { start: seg.start, end: bestEnd };
+          totalClipDuration = bestEnd - seg.start;
+          console.warn(`[${jobId}]   trimmed single segment end to ${bestEnd.toFixed(1)}s → ${totalClipDuration.toFixed(1)}s`);
+        }
+      }
+
+      validClips.push({ ...clip, segments: snappedSegments, totalDuration: totalClipDuration });
+      console.log(`[${jobId}] Clip "${clip.title || 'untitled'}": ${snappedSegments.length} segment(s), ${totalClipDuration.toFixed(1)}s total`);
+      snappedSegments.forEach((s, i) => console.log(`[${jobId}]   seg ${i + 1}: ${s.start.toFixed(2)}s → ${s.end.toFixed(2)}s (${(s.end - s.start).toFixed(1)}s)`));
+    }
+
+    if (validClips.length === 0) {
+      console.error(`[${jobId}] All clips were invalid. Raw Gemini response: ${rawText.substring(0, 500)}`);
+      res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'Gemini returned invalid timestamps — please try again' }));
+      return;
+    }
+
+    // Step 3: Extract and assemble each clip (multi-segment clips use extract-then-concat)
+    const newAssets = [];
+    const { stat } = await import('fs/promises');
+
+    for (let i = 0; i < validClips.length; i++) {
+      const clip = validClips[i];
+      const clipNumber = i + 1;
+      const clipId = randomUUID();
+      const clipPath = join(session.assetsDir, `${clipId}.mp4`);
+      const thumbPath = join(session.assetsDir, `${clipId}_thumb.jpg`);
+
+      const clipTitle = ((clip.title || '')
+        .normalize('NFD')             // decompose: é → e + combining accent
+        .replace(/[\u0300-\u036f]/g, '') // strip combining diacritics → e
+        .replace(/[''‛`´]/g, '')      // remove apostrophes
+        .replace(/[^a-zA-Z0-9 _\-]/g, ' ') // replace other specials with space
+        .replace(/\s+/g, ' ')
+        .trim()
+        .substring(0, 50)) || `viral clip ${clipNumber}`;
+
+      console.log(`[${jobId}] Assembling clip ${clipNumber} "${clipTitle}" (${clip.segments.length} segment(s))...`);
+
+      // Add a small trailing buffer so the last syllable isn't clipped at the cut point.
+      const TRAIL_BUF = 0.15; // seconds
+      if (clip.segments.length === 1) {
+        // Single segment — direct extraction
+        const seg = clip.segments[0];
+        if (seg.end <= seg.start + 0.1) {
+          console.warn(`[${jobId}] Clip ${clipNumber}: single segment has end <= start — skipping clip`);
+          continue;
+        }
+        await runFFmpeg([
+          '-y',
+          '-i', videoAsset.path,
+          '-ss', String(seg.start),
+          '-to', String(Math.min(seg.end + TRAIL_BUF, totalDuration)),
+          '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
+          '-c:a', 'aac', '-b:a', '192k',
+          '-movflags', '+faststart',
+          '-avoid_negative_ts', 'make_zero',
+          clipPath,
+        ], jobId);
+      } else {
+        // Multi-segment: extract each segment to a temp file, then concat
+        const segPaths = [];
+        const concatListPath = join(TEMP_DIR, `${jobId}-clip${clipNumber}-concat.txt`);
+
+        for (let s = 0; s < clip.segments.length; s++) {
+          const seg = clip.segments[s];
+          if (seg.end <= seg.start + 0.1) {
+            console.warn(`[${jobId}] Clip ${clipNumber} seg${s}: end ${seg.end} <= start ${seg.start} — skipping segment`);
+            continue;
+          }
+          const segPath = join(TEMP_DIR, `${jobId}-clip${clipNumber}-seg${s}.mp4`);
+          segPaths.push(segPath);
+
+          await runFFmpeg([
+            '-y',
+            '-i', videoAsset.path,
+            '-ss', String(seg.start),
+            '-to', String(Math.min(seg.end + TRAIL_BUF, totalDuration)),
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
+            '-c:a', 'aac', '-b:a', '192k',
+            '-avoid_negative_ts', 'make_zero',
+            segPath,
+          ], jobId);
+        }
+
+        // Write concat list and join segments with -c copy (lossless, same codec)
+        const concatContent = segPaths.map(p => `file '${p.replace(/\\/g, '/')}'`).join('\n');
+        writeFileSync(concatListPath, concatContent);
+
+        await runFFmpeg([
+          '-y', '-f', 'concat', '-safe', '0',
+          '-i', concatListPath,
+          '-c', 'copy',
+          '-movflags', '+faststart',
+          clipPath,
+        ], jobId);
+
+        // Cleanup temp segment files
+        for (const p of segPaths) { try { unlinkSync(p); } catch {} }
+        try { unlinkSync(concatListPath); } catch {}
+      }
+
+      // Guard: reject 0-byte output files
+      const stats = await stat(clipPath);
+      if (stats.size < 1000) {
+        console.error(`[${jobId}] Clip ${clipNumber} output is ${stats.size} bytes — FFmpeg produced empty file, skipping`);
+        try { unlinkSync(clipPath); } catch {}
+        continue;
+      }
+
+      try {
+        await generateThumbnail(clipPath, thumbPath, false);
+      } catch (e) {
+        console.warn(`[${jobId}] Thumbnail failed for clip ${clipNumber}:`, e.message);
+      }
+
+      const mediaInfo = await getMediaInfo(clipPath);
+
+      const asset = {
+        id: clipId,
+        type: 'video',
+        filename: `${clipTitle}.mp4`,
+        path: clipPath,
+        thumbPath: existsSync(thumbPath) ? thumbPath : null,
+        duration: mediaInfo.duration || clip.totalDuration,
+        size: stats.size,
+        width: mediaInfo.width || 1920,
+        height: mediaInfo.height || 1080,
+        createdAt: Date.now(),
+        aiGenerated: false,
+      };
+
+      session.assets.set(clipId, asset);
+      newAssets.push({
+        id: clipId,
+        filename: asset.filename,
+        duration: asset.duration,
+        start: clip.segments[0].start,
+        hook: clip.hook || '',
+        thumbnailUrl: asset.thumbPath ? `/session/${sessionId}/assets/${clipId}/thumbnail` : null,
+      });
+      console.log(`[${jobId}] Clip ${clipNumber} saved: "${asset.filename}" (${asset.duration.toFixed(1)}s)`);
+    }
+
+    saveAssetMetadata(session);
+    console.log(`[${jobId}] === CREATE VIRAL SHORTS COMPLETE: ${newAssets.length} clip(s) ===\n`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ success: true, clips: newAssets }));
+
+  } catch (error) {
+    console.error(`[${jobId}] Error:`, error.message);
+    try { unlinkSync(audioPath); } catch {}
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
 // Handle B-roll generation endpoint
 async function handleGenerateBroll(req, res, sessionId) {
   const session = getSession(sessionId);
@@ -4929,7 +5581,7 @@ ${attachedAssetIds?.length ? `- IMPORTANT: Include media scenes to showcase the 
       '--height', String(height),
       '--codec', 'h264',
       '--overwrite',
-      '--gl=angle', // Use Metal GPU acceleration on macOS
+      REMOTION_GL_FLAG,
     ];
 
     await new Promise((resolve, reject) => {
@@ -5347,7 +5999,7 @@ Return ONLY the complete JSON structure with your minimal change applied. No mar
       '--height', String(height),
       '--codec', 'h264',
       '--overwrite',
-      '--gl=angle', // Use Metal GPU acceleration on macOS
+      REMOTION_GL_FLAG,
     ];
 
     await new Promise((resolve, reject) => {
@@ -6503,7 +7155,7 @@ Make it visually engaging with good color choices. Use 2-4 scenes for variety.`
         '--height', String(height),
         '--codec', 'h264',
         '--overwrite',
-        '--gl=angle', // Use Metal GPU acceleration on macOS
+        REMOTION_GL_FLAG,
       ];
 
       await new Promise((resolve, reject) => {
@@ -7047,7 +7699,7 @@ async function handleRenderFromConcept(req, res, sessionId) {
       '--height', String(height),
       '--codec', 'h264',
       '--overwrite',
-      '--gl=angle', // Use Metal GPU acceleration on macOS
+      REMOTION_GL_FLAG,
     ];
 
     console.log(`[${jobId}] Remotion command: npx ${remotionArgs.join(' ')}`);
@@ -7405,7 +8057,7 @@ Pick phrases that are spread throughout the video. Each phrase should be 2-6 wor
       '--height', String(height),
       '--codec', 'h264',
       '--overwrite',
-      '--gl=angle', // Use Metal GPU acceleration on macOS
+      REMOTION_GL_FLAG,
     ];
 
     console.log(`[${jobId}] Remotion command: npx ${remotionArgs.join(' ')}`);
@@ -7757,7 +8409,7 @@ Use specific terms, concepts, and themes from the transcript.`;
       '--height', String(height),
       '--codec', 'h264',
       '--overwrite',
-      '--gl=angle', // Use Metal GPU acceleration on macOS
+      REMOTION_GL_FLAG,
     ];
 
     await new Promise((resolve, reject) => {
@@ -8713,6 +9365,10 @@ const server = http.createServer(async (req, res) => {
     // Transcription and keyword extraction
     else if (req.method === 'POST' && action === 'transcribe-and-extract') {
       await handleTranscribeAndExtract(req, res, sessionId);
+    }
+    // Viral shorts creation
+    else if (req.method === 'POST' && action === 'create-viral-shorts') {
+      await handleCreateViralShorts(req, res, sessionId);
     }
     // B-roll image generation
     else if (req.method === 'POST' && action === 'generate-broll') {

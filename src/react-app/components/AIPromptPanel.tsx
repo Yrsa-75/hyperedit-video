@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Sparkles, Send, Wand2, Clock, Terminal, CheckCircle, Loader2, VolumeX, FileVideo, Type, Image, Zap, X, Scissors, Plus, Film, Music, MapPin, Timer, ImagePlus, Move, Crop } from 'lucide-react';
+import { Sparkles, Send, Wand2, Clock, Terminal, CheckCircle, Loader2, VolumeX, FileVideo, Type, Image, Zap, X, Scissors, Plus, Film, Music, MapPin, Timer, ImagePlus, Move, Crop, TrendingUp, ChevronDown } from 'lucide-react';
 import type { TimelineClip, Track, Asset } from '@/react-app/hooks/useProject';
 import { MOTION_TEMPLATES, type TemplateId } from '@/remotion/templates';
 import MotionGraphicsPanel from './MotionGraphicsPanel';
@@ -183,6 +183,7 @@ interface AIPromptPanelProps {
   onOpenAnimationInTab?: (assetId: string, animationName: string) => string | undefined;
   onEditAnimation?: (assetId: string, editPrompt: string, v1Context?: EditTabV1Context, tabIdToUpdate?: string) => Promise<{ assetId: string; duration: number; sceneCount: number }>;
   onFaceCrop?: (assetId: string, aspectRatio: string) => Promise<{ assetId: string; facesDetected: number }>;
+  onCreateViralShorts?: (numClips: number, durationRange: string) => Promise<{ clips: Array<{ id: string; filename: string; duration: number }> }>;
   isApplying?: boolean;
   applyProgress?: number;
   applyStatus?: string;
@@ -218,6 +219,7 @@ export default function AIPromptPanel({
   onOpenAnimationInTab,
   onEditAnimation,
   onFaceCrop,
+  onCreateViralShorts,
   isApplying,
   applyProgress,
   applyStatus,
@@ -238,6 +240,10 @@ export default function AIPromptPanel({
   const [showCaptionOptions, setShowCaptionOptions] = useState(false);
   const [isCaptionFor916, setIsCaptionFor916] = useState(false);
   const [showQuickActions, setShowQuickActions] = useState(false);
+  const [showMoreActions, setShowMoreActions] = useState(false);
+  const [showViralShortConfig, setShowViralShortConfig] = useState(false);
+  const [viralShortNumClips, setViralShortNumClips] = useState(3);
+  const [viralShortDuration, setViralShortDuration] = useState('15-30');
   const [showReferencePicker, setShowReferencePicker] = useState(false);
   const [selectedReferences, setSelectedReferences] = useState<TimelineReference[]>([]);
   const [showTimeRangePicker, setShowTimeRangePicker] = useState(false);
@@ -544,6 +550,15 @@ export default function AIPromptPanel({
   ];
 
   const suggestions: Array<{ icon: React.ElementType; text: string; onAction?: () => void }> = [
+    {
+      icon: TrendingUp,
+      text: 'Create Viral Short',
+      onAction: () => {
+        setShowViralShortConfig(true);
+        setShowQuickActions(false);
+        setShowMoreActions(false);
+      },
+    },
     { icon: Type, text: 'Add captions' },
     {
       icon: Type,
@@ -572,13 +587,16 @@ export default function AIPromptPanel({
     { icon: Wand2, text: 'Remove background noise' },
     { icon: Clock, text: 'Speed up by 1.5x' },
     { icon: FileVideo, text: 'Add GIF animations' },
-    { icon: Image, text: 'Add B-roll images' },
     { icon: Scissors, text: 'Cut at chapters' },
+    { icon: Move, text: 'Add Ken Burns zoom effect' },
+    { icon: Music, text: 'Extract audio to A1' },
+  ];
+
+  const extendedSuggestions: Array<{ icon: React.ElementType; text: string; onAction?: () => void }> = [
+    { icon: Image, text: 'Add B-roll images' },
     { icon: Sparkles, text: 'Create demo animation' },
     { icon: Zap, text: 'Animate transcript' },
     { icon: Film, text: 'Add 5 animations' },
-    { icon: Move, text: 'Add Ken Burns zoom effect' },
-    { icon: Music, text: 'Extract audio to A1' },
   ];
 
   // Check if prompt is asking for a contextual animation (intro/outro that needs video context)
@@ -1208,6 +1226,35 @@ export default function AIPromptPanel({
     }
 
     throw new Error('Request timed out after 60 seconds');
+  };
+
+  // Handle the viral short workflow
+  const handleViralShortWorkflow = async () => {
+    if (!onCreateViralShorts) return;
+    setShowViralShortConfig(false);
+    setIsProcessing(true);
+    setProcessingStatus(`Generating ${viralShortNumClips} viral short(s)…`);
+    setChatHistory(prev => [...prev, {
+      type: 'assistant',
+      text: `Analyzing your video to find the ${viralShortNumClips} most viral moment(s) (${viralShortDuration.replace('-', '–')}s)…`,
+    }]);
+    try {
+      const result = await onCreateViralShorts(viralShortNumClips, viralShortDuration);
+      const count = result.clips.length;
+      const names = result.clips.map(c => `• ${c.filename} (${c.duration.toFixed(1)}s)`).join('\n');
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: `Done! Generated ${count} viral short${count > 1 ? 's' : ''} and added to your asset library:\n\n${names}`,
+      }]);
+    } catch (err) {
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: `Failed to create viral shorts: ${err instanceof Error ? err.message : String(err)}`,
+      }]);
+    } finally {
+      setIsProcessing(false);
+      setProcessingStatus('');
+    }
   };
 
   // Handle the caption workflow
@@ -2655,6 +2702,65 @@ export default function AIPromptPanel({
         <div ref={chatEndRef} />
       </div>
 
+      {/* Viral Short Config UI */}
+      {showViralShortConfig && (
+        <div className="p-4 border-t border-zinc-800/50 bg-zinc-800/50">
+          <div className="space-y-3">
+            <div className="flex items-center gap-2">
+              <TrendingUp className="w-4 h-4 text-orange-400" />
+              <div className="text-xs font-medium text-zinc-300">Create Viral Short</div>
+            </div>
+
+            {/* Number of clips */}
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-zinc-400 w-24 flex-shrink-0">How many clips:</label>
+              <input
+                type="number"
+                min={1}
+                max={10}
+                value={viralShortNumClips}
+                onChange={(e) => setViralShortNumClips(Math.max(1, Math.min(10, parseInt(e.target.value) || 1)))}
+                className="w-20 px-2 py-1.5 bg-zinc-700 border border-zinc-600 rounded text-xs text-white text-center"
+              />
+            </div>
+
+            {/* Duration selector */}
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-zinc-400 w-24 flex-shrink-0">Duration:</label>
+              <div className="relative flex-1">
+                <select
+                  value={viralShortDuration}
+                  onChange={(e) => setViralShortDuration(e.target.value)}
+                  className="w-full px-2 py-1.5 bg-zinc-700 border border-zinc-600 rounded text-xs text-white appearance-none pr-6"
+                >
+                  <option value="15-30">15 to 30 sec</option>
+                  <option value="25-60">25 to 60 sec</option>
+                  <option value="50-120">50 to 120 sec</option>
+                </select>
+                <ChevronDown className="absolute right-1.5 top-1/2 -translate-y-1/2 w-3 h-3 text-zinc-400 pointer-events-none" />
+              </div>
+            </div>
+
+            {/* Action buttons */}
+            <div className="flex gap-2 pt-1">
+              <button
+                onClick={() => setShowViralShortConfig(false)}
+                className="flex-1 px-3 py-2 bg-zinc-700 hover:bg-zinc-600 rounded-lg text-xs font-medium transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleViralShortWorkflow}
+                disabled={isProcessing}
+                className="flex-1 px-3 py-2 bg-gradient-to-r from-orange-500 to-pink-500 hover:from-orange-600 hover:to-pink-600 rounded-lg text-xs font-medium transition-all disabled:opacity-50"
+              >
+                Generate
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Caption Options UI */}
       {showCaptionOptions && (
         <div className="p-4 border-t border-zinc-800/50 bg-zinc-800/50">
@@ -2729,7 +2835,7 @@ export default function AIPromptPanel({
         <div className="relative mb-3" ref={quickActionsRef}>
           <button
             type="button"
-            onClick={() => setShowQuickActions(!showQuickActions)}
+            onClick={() => { setShowQuickActions(!showQuickActions); setShowMoreActions(false); }}
             disabled={!hasVideo || isProcessing}
             className={`w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${
               showQuickActions
@@ -2765,6 +2871,40 @@ export default function AIPromptPanel({
                   </button>
                 ))}
               </div>
+
+              {/* Extended suggestions */}
+              {showMoreActions && (
+                <div className="grid grid-cols-2 gap-1.5 mt-1.5 pt-1.5 border-t border-zinc-700">
+                  {extendedSuggestions.map((suggestion, idx) => (
+                    <button
+                      key={idx}
+                      type="button"
+                      onClick={() => {
+                        if (suggestion.onAction) {
+                          suggestion.onAction();
+                        } else {
+                          setPrompt(suggestion.text);
+                          setShowQuickActions(false);
+                          setShowMoreActions(false);
+                        }
+                      }}
+                      className="flex items-center gap-2 px-3 py-2.5 bg-zinc-700/50 hover:bg-zinc-700 rounded-lg text-xs text-left transition-colors group"
+                    >
+                      <suggestion.icon className="w-4 h-4 text-zinc-400 group-hover:text-orange-400 transition-colors flex-shrink-0" />
+                      <span className="text-zinc-300 leading-tight">{suggestion.text}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* See more / See less toggle */}
+              <button
+                type="button"
+                onClick={() => setShowMoreActions(!showMoreActions)}
+                className="w-full mt-1.5 pt-1.5 text-xs text-zinc-500 hover:text-zinc-300 transition-colors text-center border-t border-zinc-700"
+              >
+                {showMoreActions ? 'See less...' : 'See more...'}
+              </button>
             </div>
           )}
         </div>

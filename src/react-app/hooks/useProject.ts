@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 
-const LOCAL_FFMPEG_URL = 'http://localhost:3333';
+const LOCAL_FFMPEG_URL = import.meta.env.VITE_FFMPEG_SERVER_URL || 'http://localhost:3333';
 const SESSION_STORAGE_KEY = 'clipwise-session';
 
 // Asset - source file in library

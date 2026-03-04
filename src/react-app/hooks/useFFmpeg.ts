@@ -2,7 +2,7 @@ import { useState, useRef, useCallback } from 'react';
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { toBlobURL } from '@ffmpeg/util';
 
-const LOCAL_FFMPEG_URL = 'http://localhost:3333';
+const LOCAL_FFMPEG_URL = import.meta.env.VITE_FFMPEG_SERVER_URL || 'http://localhost:3333';
 
 export function useFFmpeg() {
   const [loaded, setLoaded] = useState(false);

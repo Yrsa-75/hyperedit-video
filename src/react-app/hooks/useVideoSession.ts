@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef } from 'react';
 
-const LOCAL_FFMPEG_URL = 'http://localhost:3333';
+const LOCAL_FFMPEG_URL = import.meta.env.VITE_FFMPEG_SERVER_URL || 'http://localhost:3333';
 
 interface SessionInfo {
   sessionId: string;
