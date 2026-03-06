@@ -305,7 +305,7 @@ export default function Timeline({
           });
           if (selected.size > 0) {
             setMultiSelectedIds(selected);
-            onSelectClip(selected.values().next().value);
+            onSelectClip(selected.values().next().value ?? null);
           }
         }
       }
