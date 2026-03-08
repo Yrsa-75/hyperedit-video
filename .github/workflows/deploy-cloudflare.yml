@@ -1,49 +1,10 @@
-# ============================================================
-# ClipWise – Deploy Frontend + Worker to Cloudflare
-# Triggered on every push to main branch.
-#
-# Required GitHub Secrets (set in repo Settings → Secrets):
-#   CLOUDFLARE_API_TOKEN   – from Cloudflare dashboard → API Tokens
-#   CLOUDFLARE_ACCOUNT_ID  – from Cloudflare dashboard → right sidebar
-#   VITE_FFMPEG_SERVER_URL – your Railway public URL
-#   GEMINI_API_KEY         – Google Gemini API key
-# ============================================================
-
-name: Deploy to Cloudflare
-
+# Workflow désactivé — le déploiement est géré par Cloudflare Pages directement.
+name: Deploy (disabled)
 on:
-  push:
-    branches: [main]
-  workflow_dispatch:  # Allow manual trigger from GitHub UI
-
-jobs:
-  deploy:
-    name: Build & Deploy
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm install --legacy-peer-deps
-
-      - name: Build
-        env:
-          # Bake the Railway FFmpeg server URL into the frontend bundle
-          VITE_FFMPEG_SERVER_URL: ${{ secrets.VITE_FFMPEG_SERVER_URL }}
-        run: npm run build
-
-      - name: Deploy to Cloudflare Workers
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          # Secrets are set separately via wrangler secret put (see deployment guide)
+  workflow_dispatch:
+  jobs:
+    deploy:
+        runs-on: ubuntu-latest
+            if: false
+                steps:
+                      - run: echo "disabled"
