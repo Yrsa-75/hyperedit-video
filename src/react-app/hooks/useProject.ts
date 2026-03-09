@@ -2,7 +2,7 @@ import { useState, useCallback, useRef, useEffect } from 'react';
 
 const WORKER_URL = import.meta.env.VITE_WORKER_URL || '';
 const WORKER_TOKEN = import.meta.env.VITE_WORKER_SECRET_TOKEN || '';
-// R2_PUBLIC_URL disponible via VITE_R2_PUBLIC_URL (utilisé dans les presigned URLs côté worker)
+// R2_PUBLIC_URL disponible via VITE_R2_PUBLIC_URL (utilisÃ© dans les presigned URLs cÃ´tÃ© worker)
 const PROJECT_STORAGE_KEY = 'argos-project';
 const SESSION_STORAGE_KEY = 'argos-session';
 
@@ -18,7 +18,7 @@ export interface Asset {
   thumbnailUrl: string | null;
   streamUrl?: string; // URL with cache-busting timestamp
   aiGenerated?: boolean; // True if this is a Remotion-generated animation
-  sourceAssetId?: string; // Set on face-cropped assets Ã¢ÂÂ points to the original
+  sourceAssetId?: string; // Set on face-cropped assets ÃÂ¢ÃÂÃÂ points to the original
   cropAspectRatio?: string; // Aspect ratio used when face-cropping ('9:16' | '1:1' | '16:9')
   bannerSegments?: { lines: string[]; startTime: number; endTime: number }[]; // Detected lower-thirds
 }
@@ -43,7 +43,7 @@ export interface TimelineClip {
     cropLeft?: number;
     cropRight?: number;
   };
-  // Lower-third banner overlay (no asset file Ã¢ÂÂ rendered as HTML in preview)
+  // Lower-third banner overlay (no asset file ÃÂ¢ÃÂÃÂ rendered as HTML in preview)
   bannerData?: {
     lines: string[];
     bgcolor: string;
@@ -160,7 +160,7 @@ export function useProject() {
   useEffect(() => {
     if (prevActiveTabIdRef.current !== activeTabId) {
       console.log('=================================================');
-      console.log('[useProject] Ã¢ÂÂ Ã¯Â¸Â activeTabId CHANGED!');
+      console.log('[useProject] ÃÂ¢ÃÂÃÂ ÃÂ¯ÃÂ¸ÃÂ activeTabId CHANGED!');
       console.log(`  FROM: "${prevActiveTabIdRef.current}" TO: "${activeTabId}"`);
       console.log('=================================================');
       console.trace('[useProject] Stack trace for activeTabId change:');
@@ -195,8 +195,8 @@ export function useProject() {
   useEffect(() => { captionDataRef.current = captionData; }, [captionData]);
   useEffect(() => { projectFilenameRef.current = projectFilename; }, [projectFilename]);
 
-  // Ã¢ÂÂÃ¢ÂÂ Undo / Redo (two separate stacks, max 10 undo steps) Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
-  // undoStack: states to restore when undoing (LIFO Ã¢ÂÂ last pushed = next undo target)
+  // ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ Undo / Redo (two separate stacks, max 10 undo steps) ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ
+  // undoStack: states to restore when undoing (LIFO ÃÂ¢ÃÂÃÂ last pushed = next undo target)
   // redoStack: states saved during undo, restored by redo
   type HistorySnapshot = { clips: TimelineClip[]; captionData: Record<string, CaptionData> };
   const undoStackRef = useRef<HistorySnapshot[]>([]);
@@ -276,34 +276,9 @@ export function useProject() {
     }
   }, [serverAvailable]);
 
-  // Validate stored session on mount - clear if server doesn't recognize it
-  useEffect(() => {
-    const validateSession = async () => {
-      if (!session) return;
+  // Session is client-side only — assets stored in R2, no server session validation needed
+  // (validateSession removed: Railway does not maintain server sessions)
 
-      try {
-        const response = await fetch(`${WORKER_URL}/session/${session.sessionId}/project`, {
-          method: 'GET',
-          signal: AbortSignal.timeout(3000)
-        });
-
-        if (response.status === 404) {
-          // Session no longer exists on server - clear it
-          console.log('Stored session is invalid, clearing...');
-          localStorage.removeItem(SESSION_STORAGE_KEY);
-          setSessionInternal(null);
-          setAssets([]);
-          setClips([]);
-          setCaptionData({});
-        }
-      } catch (error) {
-        // Server might be down - don't clear session yet
-        console.log('Could not validate session:', error);
-      }
-    };
-
-    validateSession();
-  }, []); // Only run once on mount
 
   // Create a new session
   const createSession = useCallback(async (): Promise<SessionInfo> => {
@@ -344,7 +319,7 @@ export function useProject() {
       }
       const { uploadUrl, publicUrl } = await presignResponse.json();
 
-      // 2. Upload direct â R2
+      // 2. Upload direct Ã¢ÂÂ R2
       setStatus(`Uploading ${file.name} to storage...`);
       const uploadResponse = await fetch(uploadUrl, {
         method: 'PUT',
@@ -353,7 +328,7 @@ export function useProject() {
       });
       if (!uploadResponse.ok) throw new Error(`Upload failed: ${uploadResponse.status}`);
 
-      // 3. MÃ©tadonnÃ©es locales
+      // 3. MÃÂ©tadonnÃÂ©es locales
       const isVideo = file.type.startsWith('video/');
       const isAudio = file.type.startsWith('audio/');
       const fileType: 'video' | 'image' | 'audio' = isVideo ? 'video' : isAudio ? 'audio' : 'image';
@@ -403,58 +378,16 @@ export function useProject() {
     setClips(prev => prev.filter(c => c.assetId !== assetId));
   }, []);
 
-  // Get asset stream URL
+  // Get asset stream URL — R2 public URL stored in asset.streamUrl
   const getAssetStreamUrl = useCallback((assetId: string): string | null => {
-    if (!session) return null;
-    return `${WORKER_URL}/session/${session.sessionId}/assets/${assetId}/stream`;
-  }, [session]);
+    const asset = assets.find(a => a.id === assetId);
+    return asset?.streamUrl ?? null;
+  }, [assets]);
 
-  // Refresh assets from server (useful after server-side asset generation)
+  // Refresh assets — assets in R2, in-memory state is source of truth
   const refreshAssets = useCallback(async (): Promise<Asset[]> => {
-    if (!session) return [];
-
-    const response = await fetch(`${WORKER_URL}/session/${session.sessionId}/assets`);
-    if (!response.ok) {
-      throw new Error('Failed to fetch assets');
-    }
-
-    const data = await response.json();
-    const serverAssets: Asset[] = (data.assets || []).map((a: {
-      id: string;
-      type: 'video' | 'image' | 'audio';
-      filename: string;
-      duration: number;
-      size: number;
-      width?: number;
-      height?: number;
-      thumbnailUrl?: string | null;
-      aiGenerated?: boolean;
-      sourceAssetId?: string;
-      cropAspectRatio?: string;
-      bannerSegments?: { lines: string[]; startTime: number; endTime: number }[];
-    }) => ({
-      id: a.id,
-      type: a.type,
-      filename: a.filename,
-      duration: a.duration,
-      size: a.size,
-      width: a.width,
-      height: a.height,
-      thumbnailUrl: a.thumbnailUrl
-        ? `${WORKER_URL}${a.thumbnailUrl}`
-        : null,
-      // Add cache-busting timestamp to force reload after file changes (e.g., dead air removal)
-      streamUrl: `${WORKER_URL}/session/${session.sessionId}/assets/${a.id}/stream?v=${Date.now()}`,
-      // Preserve aiGenerated flag for Remotion-generated animations (critical for edit workflow detection)
-      aiGenerated: a.aiGenerated || false,
-      sourceAssetId: a.sourceAssetId || undefined,
-      cropAspectRatio: a.cropAspectRatio || undefined,
-      bannerSegments: a.bannerSegments || undefined,
-    }));
-
-    setAssets(serverAssets);
-    return serverAssets;
-  }, [session]);
+    return assets;
+  }, [assets]);
 
   // Add clip to timeline
   const addClip = useCallback((
@@ -512,7 +445,7 @@ export function useProject() {
       // Remove the clip
       const filtered = prev.filter(c => c.id !== clipId);
 
-      // Never ripple caption tracks Ã¢ÂÂ captions have absolute time positions tied to speech
+      // Never ripple caption tracks ÃÂ¢ÃÂÃÂ captions have absolute time positions tied to speech
       if (!ripple || clipToDelete.trackId === 'T1') return filtered;
 
       // Ripple mode: shift subsequent clips on the same track backward
@@ -850,50 +783,12 @@ export function useProject() {
     }, 500);
   }, []);
 
-  // Load project from server (including assets)
+  // Load project from localStorage (assets in R2, project state persisted locally)
   const loadProject = useCallback(async (): Promise<void> => {
-    if (!session) return;
-
     try {
-      // Fetch assets first
-      const assetsResponse = await fetch(`${WORKER_URL}/session/${session.sessionId}/assets`);
-      if (assetsResponse.ok) {
-        const assetsData = await assetsResponse.json();
-        const serverAssets: Asset[] = (assetsData.assets || []).map((a: {
-          id: string;
-          type: 'video' | 'image' | 'audio';
-          filename: string;
-          duration: number;
-          size: number;
-          width?: number;
-          height?: number;
-          thumbnailUrl?: string | null;
-          aiGenerated?: boolean;
-        }) => ({
-          id: a.id,
-          type: a.type,
-          filename: a.filename,
-          duration: a.duration,
-          size: a.size,
-          width: a.width,
-          height: a.height,
-          thumbnailUrl: a.thumbnailUrl
-            ? `${WORKER_URL}${a.thumbnailUrl}`
-            : null,
-          // Add cache-busting timestamp to force reload after file changes
-          streamUrl: `${WORKER_URL}/session/${session.sessionId}/assets/${a.id}/stream?v=${Date.now()}`,
-          // Preserve aiGenerated flag for Remotion-generated animations (critical for edit workflow detection)
-          aiGenerated: a.aiGenerated || false,
-        }));
-        setAssets(serverAssets);
-      }
-
-      // Then fetch project
-      const response = await fetch(`${WORKER_URL}/session/${session.sessionId}/project`);
-      if (response.ok) {
-        const data = await response.json();
-        // Don't load tracks from server - always use client's default tracks
-        // Server tracks may be outdated (e.g., missing T1, V3, A2)
+      const stored = localStorage.getItem(PROJECT_STORAGE_KEY);
+      if (stored) {
+        const data = JSON.parse(stored);
         if (data.clips) setClips(data.clips);
         if (data.settings) setSettings(data.settings);
         if (data.captionData) setCaptionData(data.captionData);
@@ -902,7 +797,7 @@ export function useProject() {
     } catch (error) {
       console.error('[Project] Load failed:', error);
     }
-  }, [session]);
+  }, []);
 
   // Render project
   // Uses refs to always get latest state
@@ -959,7 +854,7 @@ export function useProject() {
       setRenderProgress(100);
       setStatus('Render complete!');
 
-      // Return download URL Ã¢ÂÂ include dimensions so server can compute the format label
+      // Return download URL ÃÂ¢ÃÂÃÂ include dimensions so server can compute the format label
       let downloadUrl = `${WORKER_URL}${result.downloadUrl}`;
       if (!preview && exportWidth && exportHeight) {
         downloadUrl += `?w=${exportWidth}&h=${exportHeight}`;
