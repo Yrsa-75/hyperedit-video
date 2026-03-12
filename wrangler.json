@@ -1,6 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "argos",
+    "main": "src/worker/index.ts",
   "compatibility_date": "2026-03-06",
   "compatibility_flags": ["nodejs_compat"],
   "assets": {
