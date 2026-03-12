@@ -1,10 +1,10 @@
 // ============================================================
-// ARGOS Worker â Point d'entrÃ©e (Railway)
+// ARGOS Worker — Point d'entrée (Railway)
 //
 // Ce serveur :
 // 1. Expose des endpoints HTTP (presigned URL, trigger manuel)
-// 2. Ãcoute Supabase Realtime pour les nouveaux jobs
-// 3. ExÃ©cute le pipeline sÃ©quentiellement
+// 2. Écoute Supabase Realtime pour les nouveaux jobs
+// 3. Exécute le pipeline séquentiellement
 // ============================================================
 import express from 'express';
 import cors from 'cors';
@@ -13,12 +13,19 @@ import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { randomUUID } from 'crypto';
 import path from 'path';
+import { spawn } from 'child_process';
+import { tmpdir } from 'os';
+import { writeFileSync, readFileSync, unlinkSync } from 'fs';
+import { promisify } from 'util';
+import { exec } from 'child_process';
 import { processJob } from './pipeline';
 import type { Job } from '../src/types/argos';
 
-// ----------------------------------------------------------------
-// Validation des variables d'environnement au dÃ©marrage
-// ----------------------------------------------------------------
+const execAsync = promisify(exec);
+
+// ---------------------------------------------------------------
+// Validation des variables d'environnement au démarrage
+// ---------------------------------------------------------------
 const REQUIRED_ENV = [
   'SUPABASE_URL',
   'SUPABASE_SERVICE_ROLE_KEY',
@@ -33,14 +40,14 @@ const REQUIRED_ENV = [
 
 for (const key of REQUIRED_ENV) {
   if (!process.env[key]) {
-    console.error(`â Variable manquante : ${key}`);
+    console.error(`⚠️ Variable manquante : ${key}`);
     process.exit(1);
   }
 }
 
-// ----------------------------------------------------------------
+// ---------------------------------------------------------------
 // Clients
-// ----------------------------------------------------------------
+// ---------------------------------------------------------------
 const supabase = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
@@ -55,9 +62,9 @@ const r2 = new S3Client({
   },
 });
 
-// ----------------------------------------------------------------
+// ---------------------------------------------------------------
 // Serveur Express
-// ----------------------------------------------------------------
+// ---------------------------------------------------------------
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -72,22 +79,16 @@ function requireAuth(req: express.Request, res: express.Response, next: express.
   next();
 }
 
-// ----------------------------------------------------------------
-// GET /health â Health check pour Railway
-// ----------------------------------------------------------------
+// ---------------------------------------------------------------
+// GET /health
+// ---------------------------------------------------------------
 app.get('/health', (_req, res) => {
-  res.json({
-    status: 'ok',
-    worker: 'argos',
-    timestamp: new Date().toISOString(),
-    queue: processingQueue.length,
-    processing: isProcessing,
-  });
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// ----------------------------------------------------------------
-// POST /api/upload/presign â GÃ©nÃ¨re une URL de prÃ©-signature R2
-// ----------------------------------------------------------------
+// ---------------------------------------------------------------
+// POST /api/upload/presign → Génère une URL de pré-signature R2
+// ---------------------------------------------------------------
 app.post('/api/upload/presign', async (req, res) => {
   const { filename, fileSize, mimeType } = req.body;
 
@@ -96,7 +97,6 @@ app.post('/api/upload/presign', async (req, res) => {
     return;
   }
 
-  // Limite de taille : 4 GB
   if (fileSize > 4 * 1024 * 1024 * 1024) {
     res.status(400).json({ error: 'Fichier trop volumineux (max 4 GB)' });
     return;
@@ -112,7 +112,7 @@ app.post('/api/upload/presign', async (req, res) => {
     ContentLength: fileSize,
   });
 
-  const uploadUrl = await getSignedUrl(r2, command, { expiresIn: 3600 }); // 1h
+  const uploadUrl = await getSignedUrl(r2, command, { expiresIn: 3600 });
 
   res.json({
     uploadUrl,
@@ -121,9 +121,9 @@ app.post('/api/upload/presign', async (req, res) => {
   });
 });
 
-// ----------------------------------------------------------------
-// POST /api/jobs/trigger â DÃ©clencher le traitement d'un job
-// ----------------------------------------------------------------
+// ---------------------------------------------------------------
+// POST /api/jobs/trigger → Déclencher le traitement d'un job
+// ---------------------------------------------------------------
 app.post('/api/jobs/trigger', async (req, res) => {
   const { jobId } = req.body;
 
@@ -143,58 +143,136 @@ app.post('/api/jobs/trigger', async (req, res) => {
     return;
   }
 
-  if (job.status !== 'pending') {
-    res.status(400).json({ error: `Job dÃ©jÃ  en statut: ${job.status}` });
-    return;
-  }
+  processJob(job as Job).catch(console.error);
 
-  enqueueJob(job as Job);
-  res.json({ message: 'Job mis en queue', jobId });
+  res.json({ status: 'processing', jobId });
 });
 
-// ----------------------------------------------------------------
-// Queue de traitement sÃ©quentielle
-// On traite un job Ã  la fois pour ne pas saturer Railway
-// ----------------------------------------------------------------
-const processingQueue: Job[] = [];
-let isProcessing = false;
+// ---------------------------------------------------------------
+// POST /session/:sessionId/face-crop → Smart crop MediaPipe
+// ---------------------------------------------------------------
+app.post('/session/:sessionId/face-crop', requireAuth, async (req: express.Request, res: express.Response) => {
+  const { assetId, aspectRatio = '9:16' } = req.body;
 
-function enqueueJob(job: Job): void {
-  if (processingQueue.some(j => j.id === job.id)) {
-    console.log(`[Queue] Job ${job.id.slice(0, 8)} dÃ©jÃ  en queue`);
+  if (!assetId) {
+    res.status(400).json({ error: 'assetId requis' });
     return;
   }
 
-  processingQueue.push(job);
-  console.log(`[Queue] Job ajoutÃ©: ${job.id.slice(0, 8)} (queue: ${processingQueue.length})`);
+  const tmpDir = tmpdir();
+  const inputPath = path.join(tmpDir, `fc_in_${randomUUID()}.mp4`);
+  const outputPath = path.join(tmpDir, `fc_out_${randomUUID()}.mp4`);
 
-  if (!isProcessing) {
-    processNext();
+  try {
+    // 1. Télécharger la vidéo depuis R2
+    const candidateUrls = [
+      `${process.env.R2_PUBLIC_URL}/${assetId}`,
+      `${process.env.R2_PUBLIC_URL}/uploads/${assetId}`,
+      `${process.env.R2_PUBLIC_URL}/uploads/${assetId}.mp4`,
+    ];
+
+    let downloaded = false;
+    for (const url of candidateUrls) {
+      try {
+        const resp = await fetch(url);
+        if (resp.ok) {
+          const buf = Buffer.from(await resp.arrayBuffer());
+          writeFileSync(inputPath, buf);
+          downloaded = true;
+          console.log(`[FaceCrop] Vidéo téléchargée depuis ${url}`);
+          break;
+        }
+      } catch {}
+    }
+
+    if (!downloaded) {
+      throw new Error(`Impossible de télécharger la vidéo : ${assetId}`);
+    }
+
+    // 2. Lancer face-crop.py pour détecter les visages
+    console.log(`[FaceCrop] Analyse MediaPipe (ratio: ${aspectRatio})...`);
+    const cropJson = await new Promise<string>((resolve, reject) => {
+      const py = spawn('python3', ['/app/scripts/face-crop.py', inputPath, aspectRatio, outputPath]);
+      let stdout = '';
+      let stderr = '';
+      py.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
+      py.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
+      py.on('close', (code: number) => {
+        console.log(`[FaceCrop] face-crop.py code=${code} stderr=${stderr.slice(-300)}`);
+        if (code !== 0) reject(new Error(`face-crop.py failed (code ${code}): ${stderr.slice(-300)}`));
+        else resolve(stdout.trim());
+      });
+    });
+
+    const cropData = JSON.parse(cropJson);
+    if (cropData.error) throw new Error(cropData.error);
+
+    const { w, h, x, y } = cropData.crop;
+    console.log(`[FaceCrop] Crop: ${w}x${h} @ (${x},${y})`);
+
+    // 3. Appliquer le crop + scale FFmpeg
+    const scaleTarget = aspectRatio === '9:16' ? '1080:1920'
+      : aspectRatio === '1:1' ? '1080:1080'
+      : '1920:1080';
+
+    await execAsync(
+      `ffmpeg -y -i "${inputPath}" -vf "crop=${w}:${h}:${x}:${y},scale=${scaleTarget}" -c:v libx264 -preset fast -crf 23 -c:a copy "${outputPath}"`
+    );
+    console.log('[FaceCrop] Encodage FFmpeg terminé');
+
+    // 4. Upload vers R2
+    const newKey = `uploads/${randomUUID()}.mp4`;
+    const fileContent = readFileSync(outputPath);
+
+    await r2.send(new PutObjectCommand({
+      Bucket: process.env.CLOUDFLARE_R2_BUCKET_NAME!,
+      Key: newKey,
+      ContentType: 'video/mp4',
+      Body: fileContent,
+    }));
+    console.log(`[FaceCrop] Uploadé: ${newKey}`);
+
+    res.json({
+      assetId: newKey,
+      publicUrl: `${process.env.R2_PUBLIC_URL}/${newKey}`,
+      key: newKey,
+    });
+
+  } catch (err) {
+    console.error('[FaceCrop] Erreur:', err);
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Smart crop failed' });
+  } finally {
+    try { unlinkSync(inputPath); } catch {}
+    try { unlinkSync(outputPath); } catch {}
   }
+});
+
+// ---------------------------------------------------------------
+// File de traitement séquentielle
+// ---------------------------------------------------------------
+const jobQueue: Job[] = [];
+let isProcessing = false;
+
+function enqueueJob(job: Job) {
+  jobQueue.push(job);
+  if (!isProcessing) processNext();
 }
 
 async function processNext(): Promise<void> {
-  if (processingQueue.length === 0) {
-    isProcessing = false;
-    return;
-  }
-
+  if (jobQueue.length === 0) { isProcessing = false; return; }
   isProcessing = true;
-  const job = processingQueue.shift()!;
-
+  const job = jobQueue.shift()!;
   try {
     await processJob(job);
   } catch (err) {
-    console.error(`[Queue] Erreur non gÃ©rÃ©e pour job ${job.id.slice(0, 8)}:`, err);
+    console.error(`[Queue] Erreur job ${job.id}:`, err);
   }
-
-  // Passer au job suivant
   setTimeout(processNext, 1000);
 }
 
-// ----------------------------------------------------------------
-// Supabase Realtime â Ãcouter les nouveaux jobs "pending"
-// ----------------------------------------------------------------
+// ---------------------------------------------------------------
+// Supabase Realtime → Écouter les nouveaux jobs "pending"
+// ---------------------------------------------------------------
 function startRealtimeListener(): void {
   console.log('[Realtime] Connexion Supabase Realtime...');
 
@@ -211,7 +289,7 @@ function startRealtimeListener(): void {
       (payload) => {
         const job = payload.new as Job;
         if (job.source_url && job.status === 'pending') {
-          console.log(`[Realtime] Nouveau job dÃ©tectÃ©: ${job.id.slice(0, 8)}`);
+          console.log(`[Realtime] Nouveau job: ${job.id.slice(0, 8)}`);
           enqueueJob(job);
         }
       }
@@ -221,19 +299,18 @@ function startRealtimeListener(): void {
     });
 }
 
-// ----------------------------------------------------------------
-// DÃ©marrage
-// ----------------------------------------------------------------
+// ---------------------------------------------------------------
+// Démarrage
+// ---------------------------------------------------------------
 const PORT = process.env.PORT ?? 3001;
 
 app.listen(PORT, () => {
-  console.log(`\nð Argos Worker dÃ©marrÃ© sur port ${PORT}`);
-  console.log(`ð¡ Ãcoute des jobs Supabase...`);
+  console.log(`\n🚀 Argos Worker démarré sur port ${PORT}`);
+  console.log(`👂 Écoute des jobs Supabase...`);
   startRealtimeListener();
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('[Worker] SIGTERM reÃ§u, arrÃªt gracieux...');
+  console.log('[Worker] SIGTERM reçu, arrêt gracieux...');
   process.exit(0);
 });
